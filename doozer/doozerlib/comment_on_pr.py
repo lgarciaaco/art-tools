@@ -1,5 +1,6 @@
 import os
 from datetime import datetime, timezone
+import re
 
 from dockerfile_parse import DockerfileParser
 from ghapi.all import GhApi
@@ -26,6 +27,9 @@ class CommentOnPr:
         self.gh_client = None  # GhApi client
         self.pr = None
 
+        pattern = re.compile(r'^(.*?)-v\d+\.\d+\.\d+')
+        self.package_name = pattern.match(self.nvr)
+
     def list_comments(self):
         """
         List the comments in a PR
@@ -39,18 +43,19 @@ class CommentOnPr:
         """
         issue_comments = self.list_comments()
         for issue_comment in issue_comments:
-            if "[ART PR BUILD NOTIFIER]" in issue_comment["body"]:
+            if f"Package name: {self.package_name}" in issue_comment["body"]:
                 return True
         return False
 
     def post_comment(self):
         """
-        Post the comment in the PR if the comment doesn't exist already
+        Post the comment in the PR
         """
         # https://docs.github.com/rest/reference/issues#create-an-issue-comment
 
         # Message to be posted to the comment
         comment = "**[ART PR BUILD NOTIFIER]**\n\n" + \
+                  f"Package name: {self.package_name}\n" + \
                   "This PR has been included in build " + \
                   f"[{self.nvr}]({BREWWEB_URL}/buildinfo" + \
                   f"?buildID={self.build_id}) " + \
@@ -113,6 +118,6 @@ class CommentOnPr:
                 LOGGER.warning("Skipped PR build notifier reporting on old PR %s", self.pr["html_url"])
                 return
 
-        # Check if comment doesn't already exist. Then post comment
+        # Check if comment doesn't already exist already. Then post comment
         if not self.check_if_comment_exist():
             self.post_comment()
