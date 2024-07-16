@@ -1,6 +1,5 @@
 import os
 from datetime import datetime, timezone
-import re
 
 from dockerfile_parse import DockerfileParser
 from ghapi.all import GhApi
@@ -26,12 +25,6 @@ class CommentOnPr:
         self.commit = None
         self.gh_client = None  # GhApi client
         self.pr = None
-        self.package_name = None
-
-        pattern = re.compile(r'^(.*?)-v\d+\.\d+\.\d+')
-        match = pattern.match(self.nvr)
-        if match:
-            self.package_name = match.group(1)
 
     def list_comments(self):
         """
@@ -46,7 +39,7 @@ class CommentOnPr:
         """
         issue_comments = self.list_comments()
         for issue_comment in issue_comments:
-            if f"Package name: {self.package_name}" in issue_comment["body"]:
+            if f"Distgit: {self.distgit_name}" in issue_comment["body"]:
                 return True
         return False
 
@@ -58,12 +51,11 @@ class CommentOnPr:
 
         # Message to be posted to the comment
         comment = "**[ART PR BUILD NOTIFIER]**\n\n" + \
-                  f"Package name: {self.package_name}\n" + \
+                  f"Distgit: {self.distgit_name}\n" + \
                   "This PR has been included in build " + \
                   f"[{self.nvr}]({BREWWEB_URL}/buildinfo" + \
-                  f"?buildID={self.build_id}) " + \
-                  f"for distgit *{self.distgit_name}*. \n All builds following this will " + \
-                  "include this PR."
+                  f"?buildID={self.build_id}).\n " + \
+                  f"All builds following this will include this PR."
 
         self.gh_client.issues.create_comment(issue_number=self.pr["number"], body=comment)
 
