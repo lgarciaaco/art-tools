@@ -26,9 +26,12 @@ class CommentOnPr:
         self.commit = None
         self.gh_client = None  # GhApi client
         self.pr = None
+        self.package_name = None
 
         pattern = re.compile(r'^(.*?)-v\d+\.\d+\.\d+')
-        self.package_name = pattern.match(self.nvr)
+        match = pattern.match(self.nvr)
+        if match:
+            self.package_name = match.group(1)
 
     def list_comments(self):
         """
