@@ -1014,6 +1014,7 @@ class ImageDistGitRepo(DistGitRepo):
         :param retries: Number of times the build should be retried.
         :return: True if the build was successful
         """
+        self.logger.info("LGARCIAAC-1")
         if self.org_image_name is None or self.org_version is None:
             if not os.path.isfile(os.path.join(self.distgit_dir, 'Dockerfile')):
                 msg = ('No Dockerfile found in {}'.format(self.distgit_dir))
@@ -1053,6 +1054,7 @@ class ImageDistGitRepo(DistGitRepo):
         try:
             # If this image is FROM another group member, we need to wait on that group member
             # Use .get('from',None) since from is a reserved word.
+            self.logger.info("LGARCIAAC-2")
             image_from = Model(self.config.get('from', None))
             if image_from.member is not Missing:
                 self._set_wait_for(image_from.member, terminate_event)
@@ -1094,6 +1096,7 @@ class ImageDistGitRepo(DistGitRepo):
                     if terminate_event.wait(timeout=5 * 60):
                         raise KeyboardInterrupt()
 
+                self.logger.info("LGARCIAAC-3")
                 if len(self.metadata.targets) > 1:
                     # FIXME: Currently we don't really support building images against multiple targets,
                     # or we would overwrite the image tag when pushing to the registry.
@@ -1110,6 +1113,7 @@ class ImageDistGitRepo(DistGitRepo):
                     if build_info:
                         record["nvrs"] = build_info["nvr"]
                     if not dry_run:
+                        self.logger.info("LGARCIAAC-4")
                         self.update_build_db(True, task_id=task_id, scratch=scratch)
                         if comment_on_pr and self.runtime.assembly == "stream":
                             try:
