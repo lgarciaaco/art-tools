@@ -1117,6 +1117,7 @@ class ImageDistGitRepo(DistGitRepo):
                         self.update_build_db(True, task_id=task_id, scratch=scratch)
                         if comment_on_pr:
                             try:
+                                self.logger.info("LGARCIAAC-5")
                                 comment_on_pr_obj = CommentOnPr(distgit_dir=self.distgit_dir,
                                                                 nvr=build_info["nvr"],
                                                                 build_id=build_info["id"],
