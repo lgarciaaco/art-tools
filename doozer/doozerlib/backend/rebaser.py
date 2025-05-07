@@ -648,14 +648,14 @@ class KonfluxRebaser:
 
             self._write_osbs_image_config(metadata, dest_dir, source, version)
 
-            self._write_rpms_lock_file(metadata, dest_dir)
-
             df_path = dest_dir.joinpath('Dockerfile')
             self._update_dockerfile(
                 metadata, source, df_path, version, release, downstream_parents, force_yum_updates, uuid_tag, dest_dir
             )
 
             self._update_csv(metadata, dest_dir, version, release, image_repo, uuid_tag)
+
+            asyncio.run(self._write_rpms_lock_file(metadata, dest_dir))
 
             return version, release
 
@@ -972,7 +972,7 @@ class KonfluxRebaser:
             gomod_deps_path.joinpath('cachito.env').touch(exist_ok=True)
 
             # The value we will set REMOTE_SOURCES_DIR to.
-            remote_source_dir_env = '/tmp/cachito-emulation'
+            remote_source_dir_env = '/tmp/art/cachito-emulation'
             pkg_managers = metadata.config.content.source.pkg_managers.primitive()
 
             if "npm" in pkg_managers:
@@ -1041,7 +1041,7 @@ class KonfluxRebaser:
         if network_mode != "hermetic":
             konflux_lines += [
                 "USER 0",
-                "RUN mkdir -p /tmp/yum_temp; mv /etc/yum.repos.d/*.repo /tmp/yum_temp/ || true",
+                "RUN mkdir -p /tmp/art/yum_temp; mv /etc/yum.repos.d/*.repo /tmp/art/yum_temp/ || true",
                 f"COPY .oit/{self.repo_type}.repo /etc/yum.repos.d/",
                 f"ADD {constants.KONFLUX_REPO_CA_BUNDLE_HOST}/{constants.KONFLUX_REPO_CA_BUNDLE_FILENAME} {constants.KONFLUX_REPO_CA_BUNDLE_TMP_PATH}",
             ]
@@ -1094,7 +1094,8 @@ class KonfluxRebaser:
             lines = [
                 "\n# Start Konflux-specific steps",
                 "USER 0",
-                "RUN rm -f /etc/yum.repos.d/* && cp /tmp/yum_temp/* /etc/yum.repos.d/ || true",
+                "RUN rm -f /etc/yum.repos.d/* && cp /tmp/art/yum_temp/* /etc/yum.repos.d/ || true",
+                "RUN rm -rf /tmp/art",
                 f"{user_to_set if user_to_set else ''}",
                 "# End Konflux-specific steps\n\n",
             ]
@@ -1373,7 +1374,7 @@ class KonfluxRebaser:
                 packages.append(pkg_entry)
         return packages
 
-    def _generate_rpms_in_file_content(self, metadata: ImageMetadata) -> Dict:
+    async def _generate_rpms_in_file_content(self, metadata: ImageMetadata) -> Dict:
         """
         Generates the `INPUT_FILE` dictionary used as input for the `rpm-lockfile-prototype` tool.
 
@@ -1401,6 +1402,7 @@ class KonfluxRebaser:
         input_file = {}
 
         cachi2_enabled = KonfluxImageBuilder._is_cachi2_enabled(metadata=metadata, logger=self._logger)
+        cachi2_enabled= True
         enabled_repos = metadata.config.get('enabled_repos')
         if cachi2_enabled and enabled_repos and len(enabled_repos) > 0:
             # If Cachi2 is enabled and there are enabled repositories, proceed to generate the INPUT_FILE for RPMs.
@@ -1408,10 +1410,10 @@ class KonfluxRebaser:
             # or retrieved from the latest successful build if not defined.
             rpms_install = metadata.config.konflux.cachi2.packages.get('install', [])
             if len(rpms_install) == 0:
-                build = asyncio.run(metadata.get_latest_build(
+                build = await metadata.get_latest_build(
                     el_target=f'el{metadata.branch_el_target()}',
                     engine=Engine.KONFLUX
-                ))
+                )
                 if not build:
                     raise ValueError(f'Could not find latest build for {metadata.distgit_key}')
 
@@ -1420,12 +1422,12 @@ class KonfluxRebaser:
                     "password": os.environ.get("KONFLUX_ART_IMAGES_PASSWORD")
                 }
 
-                _, rpms = asyncio.run(KonfluxImageBuilder.get_installed_packages(
+                _, rpms = await KonfluxImageBuilder.get_installed_packages(
                     build.image_pullspec,
                     build.arches,
                     image_repo_creds,
                     logger=self._logger
-                ))
+                )
 
                 if len(rpms) > 0:
                     # Identify the parent installed RPMs and calculate the difference (XOR) between the lists:
@@ -1436,16 +1438,17 @@ class KonfluxRebaser:
                             'name': parent[0],
                             'group': build.group,
                         }
-                        parent_build = asyncio.run(self._runtime.konflux_db.get_latest_build(**args))
+
+                        parent_build = await self._runtime.konflux_db.get_latest_build(**args)
                         if not parent_build:
                             raise ValueError(f'Could not find latest build for {parent[0]}')
 
-                        _, parent_rpms = asyncio.run(KonfluxImageBuilder.get_installed_packages(
+                        _, parent_rpms = await KonfluxImageBuilder.get_installed_packages(
                             parent_build.image_pullspec,
                             parent_build.arches,
                             image_repo_creds,
                             logger=self._logger
-                        ))
+                        )
 
                         diff = {
                             arch: list(set(rpms.get(arch, [])) - set(parent_rpms.get(arch, [])))
@@ -1480,23 +1483,26 @@ class KonfluxRebaser:
 
         return input_file
 
-    def _write_rpms_lock_file(self, metadata: ImageMetadata, dest_dir: Path):
+    async def _write_rpms_lock_file(self, metadata: ImageMetadata, dest_dir: Path, retries=2):
         # In order for cachi2 to fetch rpm dependencies, it requires the use of a pair of rpms.in.yaml and rpms.lock.yaml
         # files to be committed to the repository.
         # https://konflux-ci.dev/docs/building/prefetching-dependencies/#enabling-prefetch-builds-for-rpm
-        rpms_in_yaml = self._generate_rpms_in_file_content(metadata)
+        rpms_in_yaml = await self._generate_rpms_in_file_content(metadata)
         if not rpms_in_yaml:
             self._logger.info('No content for rpms.in.yaml file, skipping creation')
         else:
-            self._logger.info(f'Attempting to generate rpms.in.yaml and rpms.lock.yaml file from content {rpms_in_yaml}')
+            self._logger.info(f'Attempting to generate rpms.in.yaml and rpms.lock.yaml file for {metadata.distgit_key} from content {rpms_in_yaml}')
 
             # generate yaml data with header
             content_yml = yaml.safe_dump(rpms_in_yaml, default_flow_style=False)
             with dest_dir.joinpath('rpms.in.yaml').open('w', encoding="utf-8") as f:
                 f.write(CONTAINER_YAML_HEADER + content_yml)
 
-            cmd = 'rpm-lockfile-prototype --debug --outfile rpms.lock.yaml rpms.in.yaml'
-            exectools.cmd_assert(cmd, retries=3)
+            cmd = f'rpm-lockfile-prototype --debug --outfile rpms.lock.yaml rpms.in.yaml'
+            rc, stdout, _ = await exectools.cmd_gather_async(cmd, retries, cwd=dest_dir)
+            if rc != 0:
+                self._logger.warning("rpm-lockfile-prototype command failed to create lock file: %s", stdout)
+                raise ChildProcessError("rpm-lockfile-prototype command failed to create lock file")
 
     def _write_osbs_image_config(
         self, metadata: ImageMetadata, dest_dir: Path, source: Optional[SourceResolution], version: str
