@@ -1,4 +1,5 @@
 import asyncio
+from collections import defaultdict
 import copy
 import hashlib
 import io
@@ -21,6 +22,7 @@ from artcommonlib.konflux.konflux_build_record import Engine, KonfluxBuildRecord
 from artcommonlib.model import ListModel, Missing, Model
 from artcommonlib.util import deep_merge, detect_package_managers, is_cachito_enabled
 from dockerfile_parse import DockerfileParser
+from doozerlib.backend.konflux_image_builder import KonfluxImageBuilder
 from doozerlib import constants, util
 from doozerlib.backend.build_repo import BuildRepo
 from doozerlib.build_visibility import BuildVisibility, get_visibility_suffix, is_release_embargoed
@@ -645,6 +647,8 @@ class KonfluxRebaser:
             self._write_fetch_artifacts(metadata, dest_dir)
 
             self._write_osbs_image_config(metadata, dest_dir, source, version)
+
+            self._write_rpms_lock_file(metadata, dest_dir)
 
             df_path = dest_dir.joinpath('Dockerfile')
             self._update_dockerfile(
@@ -1317,6 +1321,182 @@ class KonfluxRebaser:
         if docker_cmd_options:
             cmd = " ".join(docker_cmd_options) + " " + cmd
         return changed, cmd
+
+    def _generate_package_rules(self, data: dict) -> list:
+        """
+        Transform a dictionary mapping architectures to lists of RPM package names
+        into a list of package rules suitable for YAML configuration.
+
+        For each package:
+        - If the package appears in all architectures, it is included as a simple string.
+        - If the package appears in only some architectures, it is included as a dictionary
+        with its name and an architecture rule.
+            - Use `only` to whitelist specific architectures.
+            - Use `not` to blacklist architectures when the package is present in most.
+
+        Args:
+            data (dict): A dictionary where keys are architecture strings (e.g., 'amd64') and
+                        values are lists of RPM package names present on that architecture.
+
+        Returns:
+            list: A list of package entries in the form required by a YAML spec. Each entry is
+                either a string (if no arch restrictions) or a dict with `name` and `arches`.
+        """
+
+        all_arches = set(data.keys())
+        rpm_to_arches = defaultdict(set)
+
+        # Build rpm → set of arches
+        for arch, rpms in data.items():
+            for rpm in rpms:
+                rpm_to_arches[rpm].add(arch)
+
+        # Construct package list
+        packages = []
+
+        for rpm, arches in rpm_to_arches.items():
+            if arches == all_arches:
+                packages.append(rpm)  # simple case
+            else:
+                missing = all_arches - arches
+                # Use `not` if rpm is in most arches (shorter to write)
+                if len(missing) < len(arches):
+                    pkg_entry = {
+                        'name': rpm,
+                        'arches': {'not': sorted(missing) if len(missing) > 1 else sorted(missing)[0]}
+                    }
+                else:
+                    pkg_entry = {
+                        'name': rpm,
+                        'arches': {'only': sorted(arches) if len(arches) > 1 else sorted(arches)[0]}
+                    }
+                packages.append(pkg_entry)
+        return packages
+
+    def _generate_rpms_in_file_content(self, metadata: ImageMetadata) -> Dict:
+        """
+        Generates the `INPUT_FILE` dictionary used as input for the `rpm-lockfile-prototype` tool.
+
+        This method constructs a structured input file that defines the list of RPM packages to install
+        and upgrade for a given image, along with relevant architecture and repository metadata. The
+        format aligns with the specification expected by rpm-lockfile-prototype:
+        https://github.com/konflux-ci/rpm-lockfile-prototype#whats-the-input_file
+
+        Key behavior:
+        - If the image uses Cachi2 and enabled repositories are defined, it proceeds with input generation.
+        - RPMs to install are first checked in the metadata config. If not found, it fetches the list from
+        the latest successful image build.
+        - If a parent image is defined, the method computes the RPM difference (RPMs added in the current
+        image vs. parent).
+        - The list of RPMs is transformed into package rules compatible with the lockfile format using
+        `_generate_package_rules()`.
+        - Upgrade RPMs, content origin repo files, and supported architectures are
+        also included in the final output.
+
+        Returns:
+            Dict: A dictionary representing the `INPUT_FILE` YAML structure for `rpm-lockfile-prototype`,
+                including keys such as `packages`, `upgradePackages`, `contentOrigin`, and `arches`.
+        """
+
+        input_file = {}
+
+        cachi2_enabled = KonfluxImageBuilder._is_cachi2_enabled(metadata=metadata, logger=self._logger)
+        enabled_repos = metadata.config.get('enabled_repos')
+        if cachi2_enabled and enabled_repos and len(enabled_repos) > 0:
+            # If Cachi2 is enabled and there are enabled repositories, proceed to generate the INPUT_FILE for RPMs.
+            # The list of packages to install or upgrade is either provided statically in the metadata config
+            # or retrieved from the latest successful build if not defined.
+            rpms_install = metadata.config.konflux.cachi2.packages.get('install', [])
+            if len(rpms_install) == 0:
+                build = asyncio.run(metadata.get_latest_build(
+                    el_target=f'el{metadata.branch_el_target()}',
+                    engine=Engine.KONFLUX
+                ))
+                if not build:
+                    raise ValueError(f'Could not find latest build for {metadata.distgit_key}')
+
+                image_repo_creds = {
+                    "username": os.environ.get("KONFLUX_ART_IMAGES_USERNAME"),
+                    "password": os.environ.get("KONFLUX_ART_IMAGES_PASSWORD")
+                }
+
+                _, rpms = asyncio.run(KonfluxImageBuilder.get_installed_packages(
+                    build.image_pullspec,
+                    build.arches,
+                    image_repo_creds,
+                    logger=self._logger
+                ))
+
+                if len(rpms) > 0:
+                    # Identify the parent installed RPMs and calculate the difference (XOR) between the lists:
+                    parents = metadata.get_parent_members()
+                    if len(parents) > 0:
+                        parent = next(iter(parents.items()))
+                        args = {
+                            'name': parent[0],
+                            'group': build.group,
+                        }
+                        parent_build = asyncio.run(self._runtime.konflux_db.get_latest_build(**args))
+                        if not parent_build:
+                            raise ValueError(f'Could not find latest build for {parent[0]}')
+
+                        _, parent_rpms = asyncio.run(KonfluxImageBuilder.get_installed_packages(
+                            parent_build.image_pullspec,
+                            parent_build.arches,
+                            image_repo_creds,
+                            logger=self._logger
+                        ))
+
+                        diff = {
+                            arch: list(set(rpms.get(arch, [])) - set(parent_rpms.get(arch, [])))
+                            for arch in rpms
+                        }
+
+                        rpms_install = diff
+                    else:
+                        self._logger.warning(f'Unable to fetch rpm list for base image of {metadata.image_name}')
+                        rpms_install = rpms
+                else:
+                    raise ValueError(f'Could not fetch the installed rpms list for {metadata.image_name}')
+
+            input_file['packages'] = self._generate_package_rules(rpms_install)
+
+            rpms_upgrade = metadata.config.konflux.cachi2.packages.get('upgrade', [])
+            if len(rpms_upgrade) > 0:
+                input_file['upgradePackages'] = rpms_upgrade
+
+            if 'packages' not in input_file and 'upgradePackages' not in input_file:
+                self._logger.warning('Image has neither packages or upgradePackages defined')
+            else:
+                # list of enabled_repos
+                # input_file['enabled_repos'] = enabled_repos
+
+                # content origin
+                # TODO: pass file as param if possible
+                input_file['contentOrigin'] = {'repofiles': ['.oit/unsigned.repo']}
+
+                # list of platform (architecture) names to build this image for
+                input_file['arches'] = metadata.get_arches()
+
+        return input_file
+
+    def _write_rpms_lock_file(self, metadata: ImageMetadata, dest_dir: Path):
+        # In order for cachi2 to fetch rpm dependencies, it requires the use of a pair of rpms.in.yaml and rpms.lock.yaml
+        # files to be committed to the repository.
+        # https://konflux-ci.dev/docs/building/prefetching-dependencies/#enabling-prefetch-builds-for-rpm
+        rpms_in_yaml = self._generate_rpms_in_file_content(metadata)
+        if not rpms_in_yaml:
+            self._logger.info('No content for rpms.in.yaml file, skipping creation')
+        else:
+            self._logger.info(f'Attempting to generate rpms.in.yaml and rpms.lock.yaml file from content {rpms_in_yaml}')
+
+            # generate yaml data with header
+            content_yml = yaml.safe_dump(rpms_in_yaml, default_flow_style=False)
+            with dest_dir.joinpath('rpms.in.yaml').open('w', encoding="utf-8") as f:
+                f.write(CONTAINER_YAML_HEADER + content_yml)
+
+            cmd = 'rpm-lockfile-prototype --debug --outfile rpms.lock.yaml rpms.in.yaml'
+            exectools.cmd_assert(cmd, retries=3)
 
     def _write_osbs_image_config(
         self, metadata: ImageMetadata, dest_dir: Path, source: Optional[SourceResolution], version: str
