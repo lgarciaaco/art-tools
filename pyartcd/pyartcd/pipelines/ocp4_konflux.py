@@ -12,6 +12,7 @@ import yaml
 from artcommonlib import exectools, redis
 from artcommonlib.constants import KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS
 from artcommonlib.util import new_roundtrip_yaml_handler
+from doozerlib.telemetry import initialize_telemetry
 from doozerlib.util import extract_version_fields
 
 from pyartcd import constants, jenkins, locks, util
@@ -505,6 +506,10 @@ async def ocp4(
 ):
     if not kubeconfig:
         kubeconfig = os.environ.get('KONFLUX_SA_KUBECONFIG')
+
+    if os.environ.get("TELEMETRY_ENABLED") == "1":
+        runtime.logger.info('Enabling telemetry')
+        initialize_telemetry()
 
     lock_identifier = jenkins.get_build_path()
     if not lock_identifier:
