@@ -179,7 +179,7 @@ class Repodata:
         """
         Retrieve RPM packages based on names or NVRs with intelligent version filtering.
 
-        For package names: returns the latest available version.
+        For package names: returns all available versions (backward compatibility).
         For NVRs: returns the specific requested version plus the latest available version.
 
         Args:
@@ -217,10 +217,7 @@ class Repodata:
                 if not specific_rpm:
                     not_found.append(item)
             else:
-                # For package names, return only the latest version
-                latest_rpm = self._find_latest_rpm(matching_rpms)
-                if latest_rpm:
-                    found_rpms.append(latest_rpm)
+                found_rpms.extend(matching_rpms)
 
         return found_rpms, sorted(not_found)
 
