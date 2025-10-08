@@ -443,6 +443,9 @@ class KonfluxClient:
         build_priority: str = None,
         hermetic: Optional[bool] = None,
         sast: Optional[bool] = None,
+        conforma_enabled: Optional[bool] = None,
+        compliance_date_offset: Optional[int] = None,
+        conforma_policy_env: Optional[str] = None,
         dockerfile: Optional[str] = None,
         pipelinerun_template_url: str = constants.KONFLUX_DEFAULT_IMAGE_BUILD_PLR_TEMPLATE_URL,
         annotations: Optional[dict[str, str]] = None,
@@ -522,6 +525,16 @@ class KonfluxClient:
 
         if rebuild is not None:
             _modify_param(params, "rebuild", rebuild)
+
+        if conforma_enabled is not None:
+            _modify_param(params, "conforma-enabled", "true")
+
+        if compliance_date_offset:
+            effective_date = (datetime.datetime.now() + datetime.timedelta(days=compliance_date_offset)).isoformat()
+            _modify_param(params, "conforma-effective-time", effective_date)
+
+        if conforma_policy_env:
+            _modify_param(params, "conforma-policy-env", conforma_policy_env)
 
         # See https://konflux-ci.dev/docs/how-tos/configuring/customizing-the-build/#configuring-timeouts
         obj["spec"]["timeouts"] = {"pipeline": "12h"}
@@ -648,6 +661,9 @@ class KonfluxClient:
         skip_checks: bool = False,
         build_priority: str = None,
         hermetic: Optional[bool] = None,
+        conforma_enabled: Optional[bool] = None,
+        compliance_date_offset: Optional[int] = None,
+        conforma_policy_env: Optional[str] = None,
         dockerfile: Optional[str] = None,
         pipelinerun_template_url: str = constants.KONFLUX_DEFAULT_IMAGE_BUILD_PLR_TEMPLATE_URL,
         annotations: Optional[dict[str, str]] = None,
@@ -711,6 +727,9 @@ class KonfluxClient:
             pipelinerun_template_url=pipelinerun_template_url,
             prefetch=prefetch,
             sast=sast,
+            conforma_enabled=conforma_enabled,
+            compliance_date_offset=compliance_date_offset,
+            conforma_policy_env=conforma_policy_env,
             annotations=annotations,
             artifact_type=artifact_type,
             service_account=service_account,

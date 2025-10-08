@@ -518,6 +518,15 @@ class KonfluxImageBuilder:
         image_config_sast_task = metadata.config.get("konflux", {}).get("sast", {}).get("enabled", Missing)
         sast = image_config_sast_task if image_config_sast_task is not Missing else group_config_sast_task
 
+        # Check if conforma validation needs to be enabled
+        # Image config value overrides group config value
+        group_config_conforma = metadata.runtime.group_config.get("konflux", {}).get("conforma", {})
+        image_config_conforma = metadata.config.get("konflux", {}).get("conforma", {})
+
+        conforma_enabled = image_config_conforma.get("enabled", group_config_conforma.get("enabled", False))
+        compliance_date_offset = group_config_conforma.get("compliance_date_offset_days", 21)
+        conforma_policy_env = group_config_conforma.get("policy_env", "production")
+
         pipelinerun = await self._konflux_client.start_pipeline_run_for_image_build(
             generate_name=f"{component_name}-",
             namespace=self._config.namespace,
@@ -535,6 +544,9 @@ class KonfluxImageBuilder:
             pipelinerun_template_url=self._config.plr_template,
             prefetch=prefetch,
             sast=sast,
+            conforma_enabled=conforma_enabled,
+            compliance_date_offset=compliance_date_offset,
+            conforma_policy_env=conforma_policy_env,
             annotations={"art-network-mode": metadata.get_konflux_network_mode(), "art-nvr": nvr},
             build_priority=build_priority,
         )
