@@ -9,6 +9,7 @@ RHCOS_RELEASES_STREAM_URL = (
 BREW_HUB = "https://brewhub.engineering.redhat.com/brewhub"
 BREW_DOWNLOAD_URL = "https://download.devel.redhat.com/brewroot"
 RELEASE_SCHEDULES = "https://pp.engineering.redhat.com/api/v7/releases"
+DEFAULT_PLASHET_BASE_URL = "https://ocp-artifacts.engineering.redhat.com/pub/RHOCP/plashets"
 
 # Environment variables to disable Git stdin prompts for username, password, etc
 GIT_NO_PROMPTS = {
@@ -35,20 +36,6 @@ REDIS_PORT = '6379'
 # Telemetry
 OTEL_EXPORTER_OTLP_ENDPOINT = "http://otel-collector-psi-rhv.hosts.prod.psi.rdu2.redhat.com:4317"
 
-# Sync konflux builds to default (formerly Brew) imagestreams for versions in this list
-KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS = [
-    "4.22",
-    "4.21",
-    "4.20",
-    "4.19",
-    "4.18",
-    "4.17",
-    "4.16",
-    "4.15",
-    "4.14",
-    "4.13",
-    "4.12",
-]
 KONFLUX_ART_IMAGES_SHARE = "quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share"
 
 KONFLUX_DEFAULT_BUILD_PRIORITY = 5
@@ -64,6 +51,7 @@ PRODUCT_NAMESPACE_MAP = {
     "mta": "art-mta-tenant",
     "rhmtc": "art-mtc-tenant",
     "logging": "art-logging-tenant",
+    "openshift-logging": "art-logging-tenant",
     "ocp": "ocp-art-tenant",
 }
 
@@ -72,6 +60,7 @@ PRODUCT_KUBECONFIG_MAP = {
     "mta": "MTA_KONFLUX_SA_KUBECONFIG",
     "rhmtc": "MTC_KONFLUX_SA_KUBECONFIG",
     "logging": "LOGGING_KONFLUX_SA_KUBECONFIG",
+    "openshift-logging": "LOGGING_KONFLUX_SA_KUBECONFIG",
     "ocp": "KONFLUX_SA_KUBECONFIG",
 }
 
@@ -81,4 +70,4 @@ COREOS_RHEL10_STREAMS = [
     "rhel-coreos-10",
     "rhel-coreos-10-extensions",
 ]
-ART_PROD_IMAGE_REPO = "quay.io/openshift-release-dev/ocp-v4.0-art-dev"
+# Legacy constant removed - use get_art_prod_image_repo_for_version() from artcommonlib.util instead

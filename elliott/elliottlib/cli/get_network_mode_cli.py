@@ -1,9 +1,8 @@
 import json
-from typing import Dict
 
 import click
 from artcommonlib import logutil
-from artcommonlib.konflux.konflux_build_record import ArtifactType, Engine, KonfluxBuildOutcome, KonfluxBuildRecord
+from artcommonlib.konflux.konflux_build_record import ArtifactType, KonfluxBuildOutcome, KonfluxBuildRecord
 
 from elliottlib.cli.common import cli, click_coroutine, pass_runtime
 from elliottlib.runtime import Runtime
@@ -45,6 +44,7 @@ class GetNetworkModeCli:
             assembly=assembly_to_use,
             outcome=KonfluxBuildOutcome.SUCCESS,
             artifact_type=ArtifactType.IMAGE,
+            exclude_large_columns=True,  # Only need name, nvr, hermetic - not installed_rpms/packages
         )
 
         # Filter out non-found builds

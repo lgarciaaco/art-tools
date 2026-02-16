@@ -2,11 +2,12 @@ import asyncio
 import json
 import os.path
 import shutil
+from pathlib import Path
 
 import click
 import yaml
 from artcommonlib import exectools, redis
-from artcommonlib.constants import KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS
+from artcommonlib.util import uses_konflux_imagestream_override
 
 from pyartcd import constants, jenkins, locks, oc, util
 from pyartcd import record as record_util
@@ -31,7 +32,7 @@ class BuildPlan:
         return json.dumps(self.__dict__, indent=4)
 
 
-class Ocp4Pipeline:
+class OcpPipeline:
     def __init__(
         self,
         runtime: Runtime,
@@ -118,6 +119,7 @@ class Ocp4Pipeline:
             group=f'openshift-{self.version}',
             assembly=self.assembly,
             build_system='brew',
+            working_dir=Path(self.runtime.doozer_working),
             doozer_data_path=self.data_path,
             doozer_data_gitref=self.data_gitref,
         )
@@ -220,7 +222,7 @@ class Ocp4Pipeline:
         jenkins.update_description('Pinned builds (whether source changed or not).<br/>')
         self.runtime.logger.info('Pinned builds (whether source changed or not)')
 
-        if self.version in KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS:
+        if uses_konflux_imagestream_override(self.version):
             self.runtime.logger.info(
                 'Skipping RPM rebase and build for %s since it is being handled by ocp4-konflux', {self.version}
             )
@@ -654,10 +656,8 @@ class Ocp4Pipeline:
 
         else:
             # Trigger ocp4 build sync only for streams that are not being updated with konflux builds
-            if self.version in KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS:
-                self.runtime.logger.info(
-                    f'Skipping build-sync job for streams updated by konflux builds {KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS}'
-                )
+            if uses_konflux_imagestream_override(self.version):
+                self.runtime.logger.info('Skipping build-sync job for streams updated by Konflux builds')
             else:
                 jenkins.start_build_sync(
                     build_version=self.version,
@@ -676,7 +676,7 @@ class Ocp4Pipeline:
             )
 
     async def _sweep(self):
-        if self.version not in KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS:
+        if not uses_konflux_imagestream_override(self.version):
             self.runtime.logger.info(
                 'Skipping bug sweep for %s since it is being handled by ocp4-konflux', {self.version}
             )
@@ -787,7 +787,7 @@ class Ocp4Pipeline:
         await self._rebase_and_build_rpms()
 
         # Build plashets
-        if not self.skip_plashets and self.version not in KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS:
+        if not self.skip_plashets and not uses_konflux_imagestream_override(self.version):
             group_param = f"openshift-{self.version}"
             jenkins.start_build_plashets(
                 group=group_param,
@@ -828,13 +828,13 @@ class Ocp4Pipeline:
 
 
 @cli.command(
-    "ocp4",
-    help="Build OCP 4.y components incrementally. In typical usage, scans for changes that could affect "
+    "ocp",
+    help="Build OCP components incrementally. In typical usage, scans for changes that could affect "
     "package or image builds and rebuilds the affected components. Creates new plashets if the "
     "automation is not frozen or if there are RPMs that are built in this run, and runs other jobs to "
     "sync builds to nightlies, create operator metadata, and sets MODIFIED bugs to ON_QA",
 )
-@click.option('--version', required=True, help='OCP version to scan, e.g. 4.14')
+@click.option('--version', required=True, help='OCP version to scan, e.g. 4.14, 5.0')
 @click.option('--assembly', required=True, help='The name of an assembly to rebase & build for')
 @click.option(
     '--data-path',
@@ -889,7 +889,7 @@ class Ocp4Pipeline:
 @click.option('--comment-on-pr', is_flag=True, default=False, help='Comment on source PR after successful build')
 @pass_runtime
 @click_coroutine
-async def ocp4(
+async def ocp(
     runtime: Runtime,
     version: str,
     assembly: str,
@@ -908,7 +908,7 @@ async def ocp4(
     if not lock_identifier:
         runtime.logger.warning('Env var BUILD_URL has not been defined: a random identifier will be used for the locks')
 
-    pipeline = Ocp4Pipeline(
+    pipeline = OcpPipeline(
         runtime=runtime,
         assembly=assembly,
         version=version,
@@ -934,3 +934,7 @@ async def ocp4(
             lock_name=Lock.BUILD.value.format(version=version),
             lock_id=lock_identifier,
         )
+
+
+# Add ocp4 as an alias for backward compatibility
+cli.add_command(ocp, name='ocp4')

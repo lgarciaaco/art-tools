@@ -1,7 +1,7 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest import IsolatedAsyncioTestCase
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 from artcommonlib import constants
 from artcommonlib.konflux.konflux_build_record import (
@@ -12,7 +12,7 @@ from artcommonlib.konflux.konflux_build_record import (
     KonfluxBundleBuildRecord,
 )
 from artcommonlib.konflux.konflux_db import CacheRecordsType, KonfluxDb
-from google.cloud.bigquery import Row, SchemaField
+from google.cloud.bigquery import SchemaField
 
 
 class TestKonfluxDB(IsolatedAsyncioTestCase):
@@ -479,6 +479,46 @@ class TestKonfluxDB(IsolatedAsyncioTestCase):
         # When use_cache=False, _ensure_group_cached should not be called
         ensure_cached_mock.assert_not_called()
         select_mock.assert_called_once()
+
+    @patch('artcommonlib.konflux.konflux_db.KonfluxDb._ensure_group_cached')
+    @patch('artcommonlib.bigquery.BigQueryClient.select')
+    async def test_get_latest_build_hermetic_filtering(self, select_mock, ensure_cached_mock):
+        test_cases = [
+            (True, "true"),
+            (False, "false"),
+        ]
+
+        for hermetic_value, expected_sql_fragment in test_cases:
+            with self.subTest(hermetic_value=hermetic_value, expected_sql_fragment=expected_sql_fragment):
+                ensure_cached_mock.reset_mock()
+                select_mock.reset_mock()
+                ensure_cached_mock.return_value = None
+
+                self.db.cache.get_by_name = MagicMock(return_value=None)
+
+                empty_response = MagicMock()
+                empty_response.total_rows = 0
+                empty_response.__iter__ = MagicMock(return_value=iter([]))
+                select_mock.return_value = empty_response
+
+                await self.db.get_latest_build(
+                    name='test-build',
+                    group='openshift-4.22',
+                    extra_patterns={"hermetic": hermetic_value},
+                )
+
+                self.assertGreater(select_mock.call_count, 0)
+
+                call_kwargs = select_mock.call_args.kwargs
+                where_clauses = call_kwargs.get("where_clauses", [])
+                hermetic_clause_found = False
+                for clause in where_clauses:
+                    clause_str = str(clause.compile(compile_kwargs={"literal_binds": True}))
+                    if "hermetic" in clause_str.lower() and expected_sql_fragment in clause_str.lower():
+                        hermetic_clause_found = True
+                        break
+
+                self.assertTrue(hermetic_clause_found)
 
     @patch('artcommonlib.konflux.konflux_db.KonfluxDb._ensure_group_cached')
     @patch('artcommonlib.konflux.konflux_db.KonfluxDb.from_result_row')

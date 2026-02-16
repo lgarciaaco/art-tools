@@ -34,7 +34,6 @@ from doozerlib.backend.pipelinerun_utils import PipelineRunInfo
 from doozerlib.constants import KONFLUX_DEFAULT_IMAGE_REPO
 from doozerlib.image import ImageMetadata
 from doozerlib.record_logger import RecordLogger
-from kubernetes.dynamic import resource
 from tenacity import retry, stop_after_attempt, wait_fixed
 
 LOGGER = logging.getLogger(__name__)
@@ -283,6 +282,7 @@ class KonfluxFbcFragmentMerger:
         fbc_git_password: str | None = None,
         registry_auth: Optional[str] = None,
         skip_checks: bool = False,
+        skip_fips_check: bool = False,
         plr_template: Optional[str] = None,
         major_minor_override: Optional[Tuple[int, int]] = None,
         logger: logging.Logger | None = None,
@@ -307,6 +307,7 @@ class KonfluxFbcFragmentMerger:
         self.fbc_git_password = fbc_git_password
         self.registry_auth = registry_auth
         self.skip_checks = skip_checks
+        self.skip_fips_check = skip_fips_check
         self.plr_template = plr_template or constants.KONFLUX_DEFAULT_FBC_BUILD_PLR_TEMPLATE_URL
         self.major_minor_override = major_minor_override
         self._logger = logger or LOGGER.getChild(self.__class__.__name__)
@@ -562,6 +563,7 @@ class KonfluxFbcFragmentMerger:
             hermetic=True,  # FBC should be built in hermetic mode
             dockerfile="catalog.Dockerfile",
             skip_checks=self.skip_checks,
+            skip_fips_check=self.skip_fips_check,
             pipelinerun_template_url=self.plr_template,
             build_priority=FBC_BUILD_PRIORITY,
         )
@@ -749,7 +751,7 @@ class KonfluxFbcRebaser:
         else:
             logger.info("Catalog file %s does not exist, bootstrap a new one", catalog_file_path)
             icon = next(iter(csv.get("spec", {}).get("icon", [])), None)
-            catalog_blobs = self._bootstrap_catalog(olm_package, default_channel_name, icon)
+            catalog_blobs = KonfluxFbcRebaser._bootstrap_catalog(olm_package, default_channel_name, icon)
 
         categorized_catalog_blobs = self._catagorize_catalog_blobs(catalog_blobs)
         if olm_package not in categorized_catalog_blobs:
@@ -769,14 +771,40 @@ class KonfluxFbcRebaser:
                 (it for it in channel['entries'] if it.get('skips')), None
             )  # Find which bundle has the skips field
             if bundle_with_skips is not None:
+                # the channel already has skips like
+                # ------------
+                # entries:
+                # - name: clusterresourceoverride-operator.v4.21.0-202601292040
+                #   skipRange: '>=4.3.0 <4.21.0-202601292040'
+                # - name: clusterresourceoverride-operator.v4.21.0-202602091142
+                #   skipRange: '>=4.3.0 <4.21.0-202602091142'
+                #   skips:
+                #   - clusterresourceoverride-operator.v4.21.0-202601292040
+                # name: stable
+                # package: clusterresourceoverride
+                # schema: olm.channel
+                # ------------
                 # Then we move the skips field to the new bundle
                 # and add the bundle name of bundle_with_skips to the skips field
                 skips = set(bundle_with_skips.pop('skips'))
                 skips = (skips | {bundle_with_skips['name']}) - {olm_bundle_name}
             elif len(channel['entries']) == 1:
+                # The channel only has one entry like
+                # ------------
+                # entries:
+                # - name: clusterresourceoverride-operator.v4.21.0-202601292040
+                #   skipRange: '>=4.3.0 <4.21.0-202601292040'
+                # name: stable
+                # package: clusterresourceoverride
+                # schema: olm.channel
+                # ------------
                 # In case the channel only contain one single entry, that bundle should
                 # become the only member of new-entry's `skip`.
-                skips = {channel['entries'][0]['name']}
+                only_entry_name = channel['entries'][0]['name']
+                if only_entry_name != olm_bundle_name:
+                    # Only if the new bundle build don't have the same name as the only_entry_name one
+                    # if the new build have the same name like 202601292040 we should do nothing(no skips)
+                    skips = {only_entry_name}
 
             # For an operator bundle that uses replaces -- such as OADP
             # Update "replaces" in the channel
@@ -811,9 +839,10 @@ class KonfluxFbcRebaser:
             logger.info("Updating channel %s", channel_name)
             channel = categorized_catalog_blobs[olm_package]["olm.channel"].get(channel_name, None)
             if not channel:
-                raise IOError(
-                    f"Channel {channel_name} not found in package {olm_package}. The FBC repo is not properly initialized."
-                )
+                logger.info("Channel %s not found in package %s. Bootstrapping...", channel_name, olm_package)
+                channel = KonfluxFbcRebaser._bootstrap_channel(olm_package, channel_name)
+                categorized_catalog_blobs[olm_package].setdefault("olm.channel", {})[channel_name] = channel
+                catalog_blobs.append(channel)
             _update_channel(channel)
 
         # Set default channel
@@ -902,8 +931,9 @@ class KonfluxFbcRebaser:
         dfp.labels['com.redhat.art.nvr'] = nvr
         return nvr
 
+    @staticmethod
     def _bootstrap_catalog(
-        self, package_name: str, default_channel: str, icon: Dict[str, str] | None
+        package_name: str, default_channel: str, icon: Dict[str, str] | None
     ) -> List[Dict[str, Any]]:
         """Bootstrap a new catalog for the given package name.
         :param package_name: The name of the package to bootstrap.
@@ -928,16 +958,26 @@ class KonfluxFbcRebaser:
             "name": package_name,
             "schema": "olm.package",
         }
-        channel_blob = {
-            "entries": [],
-            "name": default_channel,
-            "package": package_name,
-            "schema": "olm.channel",
-        }
+        channel_blob = KonfluxFbcRebaser._bootstrap_channel(package_name, default_channel)
         return [
             package_blob,
             channel_blob,
         ]
+
+    @staticmethod
+    def _bootstrap_channel(package_name: str, channel_name: str) -> Dict[str, Any]:
+        """Bootstrap a new channel for the given package.
+        :param package_name: The name of the package.
+        :param channel_name: The name of the channel to bootstrap.
+        :return: A dictionary representing the channel blob.
+        """
+        channel_blob = {
+            "entries": [],
+            "name": channel_name,
+            "package": package_name,
+            "schema": "olm.channel",
+        }
+        return channel_blob
 
     def _generate_image_digest_mirror_set(self, olm_bundle_blobs: Iterable[Dict], ref_pullspecs: Iterable[str]):
         dest_repos = {}

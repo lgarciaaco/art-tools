@@ -28,8 +28,6 @@ from pyartcd.util import (
     reset_rebase_fail_counter,
 )
 
-LOGGER = logging.getLogger(__name__)
-
 OKD_ARCHES = ['x86_64']
 
 
@@ -44,7 +42,7 @@ class BuildPlan:
         return json.dumps(self.__dict__, indent=4, cls=EnumEncoder)
 
 
-class KonfluxOkd4Pipeline:
+class KonfluxOkdPipeline:
     def __init__(
         self,
         runtime: Runtime,
@@ -75,6 +73,7 @@ class KonfluxOkd4Pipeline:
         self.build_priority = build_priority
         self.imagestream_namespace = imagestream_namespace
 
+        self.logger = logging.getLogger(__name__)
         self.group_images = []
         self.build_plan = BuildPlan(BuildStrategy(image_build_strategy))
         self.slack_client = runtime.new_slack_client()
@@ -90,6 +89,7 @@ class KonfluxOkd4Pipeline:
             f'--working-dir={self.runtime.doozer_working}',
             f'--data-path={data_path}',
             '--build-system=konflux',
+            '--load-okd-only',
             f'--arches={",".join(OKD_ARCHES)}',
             group_param,
         ]
@@ -98,6 +98,7 @@ class KonfluxOkd4Pipeline:
         await self.initialize()
         await self.rebase_and_build_images()
         await self.update_imagestreams()
+        await self.mirror_coreos_imagestreams()
         self.finalize()
 
     async def initialize(self):
@@ -116,8 +117,10 @@ class KonfluxOkd4Pipeline:
             group=f'openshift-{self.version}',
             assembly=self.assembly,
             build_system='konflux',
+            working_dir=Path(self.runtime.doozer_working),
             doozer_data_path=self.data_path,
             doozer_data_gitref=self.data_gitref,
+            load_okd_only=True,
         )
         self.build_plan.active_image_count = len(self.group_images)
 
@@ -125,7 +128,7 @@ class KonfluxOkd4Pipeline:
         self.check_building_images()
 
         # Log the initial build plan
-        LOGGER.info('Initial build plan:\n%s', self.build_plan)
+        self.logger.info('Initial build plan:\n%s', self.build_plan)
 
     def check_building_images(self):
         if self.build_plan.image_build_strategy == BuildStrategy.NONE:
@@ -172,10 +175,10 @@ class KonfluxOkd4Pipeline:
     async def rebase_images(self, version: str, input_release: str):
         # If no images are being built, skip the rebase step
         if not self.building_images():
-            LOGGER.warning('No images will be rebased')
+            self.logger.warning('No images will be rebased')
             return
 
-        LOGGER.info(f"Rebasing images for OCP {self.version} with release {self.release}")
+        self.logger.info(f"Rebasing images for OCP {self.version} with release {self.release}")
 
         cmd = self._doozer_base_command.copy()
         cmd.append('--latest-parent-version')
@@ -210,7 +213,7 @@ class KonfluxOkd4Pipeline:
         rebase_failures = [image for image, state in state['images:okd:rebase']['images'].items() if state == 'failure']
 
         if rebase_failures:
-            LOGGER.warning(f'Following images failed to rebase and won\'t be built: {",".join(rebase_failures)}')
+            self.logger.warning(f'Following images failed to rebase and won\'t be built: {",".join(rebase_failures)}')
             if len(rebase_failures) <= 10:
                 jenkins.update_description(f'Rebase failures: {", ".join(rebase_failures)}<br>')
             else:
@@ -219,7 +222,7 @@ class KonfluxOkd4Pipeline:
         # OKD disabled images have not been rebased and must not be built
         skipped_images = [image for image, state in state['images:okd:rebase']['images'].items() if state == 'skipped']
         if skipped_images:
-            LOGGER.warning(
+            self.logger.warning(
                 f'Following images are disabled in OKD and have not been rebased: {",".join(skipped_images)}'
             )
             if len(skipped_images) <= 10:
@@ -292,10 +295,10 @@ class KonfluxOkd4Pipeline:
 
     async def build_images(self):
         if not self.building_images():
-            LOGGER.warning('No images will be built')
+            self.logger.warning('No images will be built')
             return
 
-        LOGGER.info(f'Building images for OCP {self.version} with release {self.release}')
+        self.logger.info(f'Building images for OCP {self.version} with release {self.release}')
 
         cmd = self._doozer_base_command.copy()
 
@@ -327,10 +330,10 @@ class KonfluxOkd4Pipeline:
             cmd.append('--dry-run')
 
         # Add build priority. Can be a str between "1" (highest priority) - "10" or "auto"
-        LOGGER.info(f"Using build priority: {self.build_priority}")
+        self.logger.info(f"Using build priority: {self.build_priority}")
         cmd.extend(['--build-priority', self.build_priority])
 
-        LOGGER.info('Running command: %s', ' '.join(cmd))
+        self.logger.info('Running command: %s', ' '.join(cmd))
 
         try:
             await exectools.cmd_assert_async(cmd)
@@ -344,7 +347,7 @@ class KonfluxOkd4Pipeline:
     def handle_built_images(self):
         record_log = self.parse_record_log()
         if not record_log:
-            LOGGER.error('record.log not found!')
+            self.logger.error('record.log not found!')
             return
 
         self.built_images = [
@@ -358,7 +361,7 @@ class KonfluxOkd4Pipeline:
             if not int(entry['status'])
         ]
         if self.built_images:
-            LOGGER.info('Built images: %s', self.built_images)
+            self.logger.info('Built images: %s', self.built_images)
             if len(self.built_images) <= 10:
                 jenkins.update_description(
                     f'Built images: {", ".join([image["name"] for image in self.built_images])}<br>'
@@ -373,6 +376,35 @@ class KonfluxOkd4Pipeline:
             else:
                 jenkins.update_description(f'Build failures: {len(failed_images)} images<br>')
 
+    def _get_payload_tag_name(self, image_distgit_key: str, image_metadata: dict) -> str:
+        """
+        Get the payload tag name for an image, honoring the payload_name config.
+        Checks okd.payload_name first (takes precedence), then payload_name.
+        """
+        # Check for okd.payload_name override (highest precedence)
+        okd_payload_name = image_metadata.get('okd', {}).get('payload_name')
+        if okd_payload_name:
+            return okd_payload_name
+
+        # Check for payload_name config
+        payload_name = image_metadata.get('payload_name')
+        if payload_name:
+            return payload_name
+
+        # Final fallback: derive from the image name
+        image_name = image_metadata.get('name', '')
+        if image_name:
+            # Extract short name from full image name (e.g., "openshift/ose-foo" -> "ose-foo")
+            image_name_short = image_name.split('/')[-1]
+        else:
+            # Use distgit key as fallback
+            image_name_short = image_distgit_key
+
+        # Strip "ose-" prefix if present
+        if image_name_short.startswith('ose-'):
+            return image_name_short[4:]
+        return image_name_short
+
     async def update_imagestreams(self):
         """
         Update static OKD imagestream with successfully built images:
@@ -380,55 +412,132 @@ class KonfluxOkd4Pipeline:
         """
 
         if self.assembly != 'stream':
-            LOGGER.info('Assembly is not "stream"; skipping imagestream updates')
+            self.logger.info('Assembly is not "stream"; skipping imagestream updates')
             return
 
         if not self.built_images:
-            LOGGER.warning('No images were successfully built; skipping imagestream updates')
+            self.logger.warning('No images were successfully built; skipping imagestream updates')
             return
 
         if self.runtime.dry_run:
-            LOGGER.info('[DRY RUN] Would update imagestreams in namespace %s', self.imagestream_namespace)
-            LOGGER.info('[DRY RUN] Would tag %d images', len(self.built_images))
+            self.logger.info('[DRY RUN] Would update imagestreams in namespace %s', self.imagestream_namespace)
+            self.logger.info('[DRY RUN] Would tag %d images', len(self.built_images))
             return
+
+        # Load image metadata from ocp-build-data to get payload tag names
+        self.logger.info('Loading image metadata to resolve payload tag names')
+        ocp_build_data_path = Path(self.runtime.doozer_working) / 'ocp-build-data' / 'images'
 
         is_name = f'scos-{self.version}-art'
         env = os.environ.copy()
         successful_tags = []
         failed_tags = []
 
-        # Tag each newly built image into the imagestream
-        LOGGER.info('Updating imagestream: %s in namespace %s', is_name, self.imagestream_namespace)
         for image in self.built_images:
+            # Load image metadata file
             image_name = image['name']
+            yaml_file = ocp_build_data_path / f'{image_name}.yml'
+
+            try:
+                with open(yaml_file) as f:
+                    image_metadata = yaml.safe_load(f)
+
+            except Exception as e:
+                self.logger.warning('Failed to load metadata for %s: %s. Using image name as tag.', image_name, e)
+                failed_tags.append(image_name)
+                continue
+
+            if not image_metadata.get('for_payload', False):
+                self.logger.info('Image %s not needed for OKD payload: skipping imagestream tag update', image_name)
+                continue
+
+            # Determine payload tag name
+            payload_tag = self._get_payload_tag_name(image_name, image_metadata)
             image_pullspec = image.get('image_pullspec')
             image_tag = image.get('image_tag')
 
             if not image_pullspec or not image_tag:
-                LOGGER.warning('Image %s missing pullspec or tag; skipping', image_name)
+                self.logger.warning('Image %s missing pullspec or tag; skipping', image_name)
                 failed_tags.append(image_name)
                 continue
 
             # Tag into imagestream
-            target = f'{self.imagestream_namespace}/{is_name}:{image_name}'
+            target = f'{self.imagestream_namespace}/{is_name}:{payload_tag}'
             try:
                 await self._tag_image_to_stream(source_pullspec=image_pullspec, target_tag=target, env=env)
-                LOGGER.info('Tagged %s into %s', image_name, target)
+                self.logger.info('Tagged %s into %s', image_name, target)
                 successful_tags.append(image_name)
+
             except Exception as e:
-                LOGGER.warning('Failed to tag %s into imagestream: %s', image_name, e)
+                self.logger.warning('Failed to tag %s into imagestream: %s', image_name, e)
                 failed_tags.append(image_name)
 
         # Update Jenkins description with results
         if successful_tags:
             success_msg = f'Updated {is_name} with {len(successful_tags)} images'
             jenkins.update_description(f'{success_msg}<br>')
-            LOGGER.info(success_msg)
+            self.logger.info(success_msg)
 
         if failed_tags:
             failure_msg = f'Imagestream update failures: {", ".join(failed_tags)}'
             jenkins.update_description(f'{failure_msg}<br>')
-            LOGGER.warning(failure_msg)
+            self.logger.warning(failure_msg)
+
+    async def mirror_coreos_imagestreams(self):
+        """
+        Mirror OKD CoreOS imagestream tags from RHCOS team's tags to ART's imagestreams.
+        This is a temporary solution until the RHCOS team starts mirroring to ART's imagestreams directly.
+
+        Mirrors:
+        - origin/scos-{version}:stream-coreos -> origin/scos-{version}-art:stream-coreos
+        - origin/scos-{version}:stream-coreos-extensions -> origin/scos-{version}-art:stream-coreos-extensions
+
+        Special cases:
+        - 4.21 and 4.22: Skip mirroring (handled by https://github.com/openshift/release/pull/74529/)
+        - 4.23 and 5.0: Use 4.22 as the source
+        """
+
+        if self.assembly != 'stream':
+            self.logger.info('Assembly is not "stream"; skipping CoreOS imagestream mirroring')
+            return
+
+        # Skip mirroring for 4.21 and 4.22 as it's handled by openshift/release PR #74529
+        if self.version in ['4.21', '4.22']:
+            self.logger.info('Version %s: CoreOS mirroring is handled by openshift/release; skipping', self.version)
+            return
+
+        tags_to_mirror = ['stream-coreos', 'stream-coreos-extensions']
+
+        # For OKD 4.23 and 5.0, use 4.22 as the source
+        source_version = '4.22' if self.version in ['4.23', '5.0'] else self.version
+
+        if self.runtime.dry_run:
+            self.logger.info('[DRY RUN] Would mirror CoreOS imagestream tags')
+            for tag in tags_to_mirror:
+                self.logger.info(f'[DRY RUN] From: {self.imagestream_namespace}/scos-{source_version}:{tag}')
+                self.logger.info(f'[DRY RUN] To: {self.imagestream_namespace}/scos-{self.version}-art:{tag}')
+            return
+
+        env = os.environ.copy()
+
+        for tag in tags_to_mirror:
+            source_tag = f'{self.imagestream_namespace}/scos-{source_version}:{tag}'
+            target_tag = f'{self.imagestream_namespace}/scos-{self.version}-art:{tag}'
+
+            self.logger.info('Mirroring CoreOS imagestream from %s to %s', source_tag, target_tag)
+
+            try:
+                await self._tag_image_to_stream(source_pullspec=source_tag, target_tag=target_tag, env=env)
+                success_msg = f'Mirrored CoreOS tag: {source_tag} -> {target_tag}'
+                jenkins.update_description(f'{success_msg}<br>')
+                self.logger.info(success_msg)
+
+            except Exception as e:
+                failure_msg = f'Failed to mirror CoreOS imagestream tag: {e}'
+                jenkins.update_description(f'{failure_msg}<br>')
+                self.logger.warning(failure_msg)
+                # Don't fail the entire pipeline if CoreOS mirroring fails
+                self.logger.warning('Continuing pipeline despite CoreOS mirroring failure')
 
     async def _tag_image_to_stream(self, source_pullspec: str, target_tag: str, env: dict):
         """
@@ -448,7 +557,7 @@ class KonfluxOkd4Pipeline:
             target_tag,
         ]
 
-        LOGGER.debug('Running: %s', ' '.join(cmd))
+        self.logger.debug('Running: %s', ' '.join(cmd))
         await exectools.cmd_assert_async(cmd, env=env, stdout=sys.stderr)
 
     def parse_record_log(self) -> Optional[dict]:
@@ -508,7 +617,7 @@ class KonfluxOkd4Pipeline:
             return yaml.safe_load(state_yaml)
 
 
-@cli.command("okd4", help="A pipeline to build images with Konflux for OCP 4")
+@cli.command("okd", help="A pipeline to build images with Konflux for OKD")
 @click.option(
     '--image-build-strategy',
     required=True,
@@ -553,11 +662,11 @@ class KonfluxOkd4Pipeline:
     '--imagestream-namespace',
     required=False,
     default='origin',
-    help='Namespace for OKD imagestream updates (default: ocp)',
+    help='Namespace for OKD imagestream updates (default: origin)',
 )
 @pass_runtime
 @click_coroutine
-async def okd4(
+async def okd(
     runtime: Runtime,
     image_build_strategy: str,
     image_list: Optional[str],
@@ -574,7 +683,7 @@ async def okd4(
     if not lock_identifier:
         runtime.logger.warning('Env var BUILD_URL has not been defined: a random identifier will be used for the locks')
 
-    pipeline = KonfluxOkd4Pipeline(
+    pipeline = KonfluxOkdPipeline(
         runtime=runtime,
         image_build_strategy=image_build_strategy,
         image_list=image_list,
@@ -594,7 +703,7 @@ async def okd4(
     else:
         await locks.run_with_lock(
             coro=pipeline.run(),
-            lock=Lock.BUILD_OKD4,
-            lock_name=Lock.BUILD_OKD4.value.format(version=version),
+            lock=Lock.BUILD_OKD,
+            lock_name=Lock.BUILD_OKD.value.format(version=version),
             lock_id=lock_identifier,
         )

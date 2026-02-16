@@ -6,20 +6,17 @@ import logging
 import os
 import re
 import shutil
-import ssl
 import sys
 import tarfile
 import traceback
 from collections import OrderedDict
-from datetime import datetime, timezone
-from io import StringIO
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Union
 from urllib.parse import quote, urlparse
 
 import aiohttp
 import click
-import gitlab
 import requests
 from artcommonlib import exectools
 from artcommonlib.arch_util import (
@@ -31,11 +28,16 @@ from artcommonlib.arch_util import (
 from artcommonlib.assembly import AssemblyTypes
 from artcommonlib.exceptions import VerificationError
 from artcommonlib.exectools import manifest_tool, to_thread
+from artcommonlib.gitlab import GitLabClient
 from artcommonlib.rhcos import get_primary_container_name
-from artcommonlib.util import isolate_major_minor_in_group, new_roundtrip_yaml_handler
-from elliottlib.shipment_utils import get_shipment_config_from_mr, get_shipment_configs_from_mr
+from artcommonlib.util import isolate_major_minor_in_group
+from elliottlib.errata import get_errata_live_id
+from elliottlib.shipment_model import ShipmentConfig
+from elliottlib.shipment_utils import (
+    get_shipment_config_from_mr,
+    get_shipment_configs_from_mr,
+)
 from github import Github, GithubException
-from requests_gssapi import HTTPSPNEGOAuth
 from ruamel.yaml import YAML
 from ruamel.yaml.parser import ParserError
 from semver import VersionInfo
@@ -298,14 +300,7 @@ class PromotePipeline:
                 image_shipment = get_shipment_config_from_mr(shipment_url, "image")
                 if not image_shipment:
                     raise ValueError("Could not find image shipment config in merge request!")
-                live_id = image_shipment.shipment.data.releaseNotes.live_id
-                if not live_id:
-                    raise ValueError("Could not find live ID in image shipment config!")
-
-                # construct full advisory id like RHBA-2025:13660
-                advisory_type = image_shipment.shipment.data.releaseNotes.type
-                year = datetime.now().strftime("%Y")
-                full_advisory_id = f"{advisory_type}-{year}:{live_id}"
+                full_advisory_id = self.get_full_advisory_id_from_shipment(image_shipment)
                 logger.info("Constructed full advisory ID from shipment config: %s", full_advisory_id)
                 # TODO: ensure that shipment MR is open and is not in a draft state (and optionally stage push is successful)
             else:
@@ -326,7 +321,7 @@ class PromotePipeline:
                             justification = self._reraise_if_not_permitted(err, "INVALID_ERRATA_STATUS", permits)
                             justifications.append(justification)
 
-                        full_advisory_id = self.get_live_id(image_advisory_info)
+                        full_advisory_id = self.get_full_advisory_id_from_errata_advisory(image_advisory_info)
 
             if assembly_type in [AssemblyTypes.STANDARD, AssemblyTypes.CANDIDATE]:
                 if not full_advisory_id:
@@ -360,9 +355,8 @@ class PromotePipeline:
                 if assembly_type in [AssemblyTypes.PREVIEW, AssemblyTypes.CANDIDATE] or self.assembly.endswith(".0"):
                     no_verify_blocking_bugs = True
 
-                verify_flaws = True
-                if "prerelease" in impetus_advisories.keys() or assembly_type == AssemblyTypes.PREVIEW:
-                    verify_flaws = False
+                # flaws should be verified for all assemblies except previews
+                verify_flaws = not (assembly_type == AssemblyTypes.PREVIEW)
 
                 try:
                     await self.verify_attached_bugs(
@@ -965,7 +959,7 @@ class PromotePipeline:
         # Starting from 4.14, oc-mirror will be synced for all arches. See ART-6820 and ART-6863
         # oc-mirror was introduced in 4.10, so skip for <= 4.9.
         major, minor = isolate_major_minor_in_group(self.group)
-        if (major > 4 or minor >= 14) or (major == 4 and minor >= 10 and build_arch == 'x86_64'):
+        if (major, minor) >= (4, 14) or ((major, minor) >= (4, 10) and build_arch == 'x86_64'):
             # oc image  extract requires an empty destination directory. So do this before extracting tools.
             # oc adm release extract --tools does not require an empty directory.
             image_stat, oc_mirror_pullspec = get_release_image_pullspec(pullspec, "oc-mirror")
@@ -1019,8 +1013,25 @@ class PromotePipeline:
 
         return f"{build_arch}/clients/{client_type}/{release_name}/sha256sum.txt"
 
-    async def sigstore_sign(self, release_name: str, release_infos: Dict):
-        """Signs release and component images with sigstore/cosign which publishes to quay"""
+    async def sigstore_sign(
+        self,
+        release_name: str,
+        release_infos: Dict,
+    ):
+        """Signs release and component images with sigstore/cosign which publishes to quay.
+
+        Release images are signed with both digest and canonical tag identities
+        (e.g., "quay.io/.../ocp-release:4.16.1-x86_64"). This enables customers to verify
+        images referenced by tag without needing signedIdentity overrides in their policy
+        configuration.
+
+        Component images are signed with digest identity only.
+
+        :param release_name: The release name (e.g., "4.16.1")
+        :param release_infos: Dict mapping arch to release info (containing "image" and "digest")
+        """
+        from pyartcd.signatory import ReleaseImageInfo
+
         CONCURRENCY_LIMIT = 100  # we run out of processes without a limit
         signatory = SigstoreSignatory(
             logger=self._logger,
@@ -1030,25 +1041,66 @@ class PromotePipeline:
             signing_key_ids=os.environ.get("KMS_KEY_ID", "dummy-key").strip().split(','),
             rekor_url=os.environ.get("REKOR_URL", ""),
             concurrency_limit=CONCURRENCY_LIMIT,
-            sign_release=True,
-            sign_components=True,
-            verify_release=False,  # not needed when we're supplying the shasum pullspecs
         )
-        # recursively discover all the pullspecs that need to be signed.
-        images: List[str] = [
-            # for paranoia, refer to release image pullspecs with shasums
-            signatory.redigest_pullspec(info["image"], info["digest"])
-            for info in release_infos.values()
-        ]
-        need_signing: Set[str] = set()
-        errors: Dict[str, str] = {}  # pullspec -> exception
-        need_signing, errors = await signatory.discover_pullspecs(images, release_name)
 
-        if errors:
-            # this should be impossible given we just created the pullspecs
-            raise IOError(f"Not all pullspecs examined were viable: {errors}")
-        if errors := await signatory.sign_pullspecs(need_signing):
-            raise IOError(f"Not all signings succeeded, check errors: {errors}")
+        # --- Phase 1: Discover release images and their manifests ---
+        # For manifest lists, this discovers all arch-specific manifests.
+        # All manifests from a manifest list are signed with the same canonical tag.
+        release_images: List[ReleaseImageInfo] = []
+        all_errors: Dict[str, Exception] = {}
+
+        for arch, info in release_infos.items():
+            # For paranoia, refer to release image pullspecs with shasums
+            digest_pullspec = signatory.redigest_pullspec(info["image"], info["digest"])
+
+            # Extract the canonical tag (e.g., "4.16.1-x86_64" or "4.16.1-multi")
+            canonical_tag = info["image"].split(":")[-1]
+            self._logger.info("Discovering release image %s with canonical tag: %s", digest_pullspec, canonical_tag)
+
+            release_info, errors = await signatory.discover_release_image(
+                pullspec=digest_pullspec,
+                canonical_tag=canonical_tag,
+                release_name=release_name,
+            )
+            release_images.append(release_info)
+            all_errors.update(errors)
+
+        if all_errors:
+            raise IOError(f"Release image discovery failed: {all_errors}")
+
+        # --- Phase 2: Discover component images ---
+        # Component images don't need canonical tag signing.
+        component_images: Set[str] = set()
+
+        # Use the first release image to get component references
+        # (all arch variants have the same components)
+        first_release = next(iter(release_infos.values()))
+        first_pullspec = signatory.redigest_pullspec(first_release["image"], first_release["digest"])
+
+        self._logger.info("Discovering component images from %s", first_pullspec)
+        components, errors = await signatory.discover_component_images(
+            release_pullspec=first_pullspec,
+            release_name=release_name,
+        )
+        component_images.update(components)
+        all_errors.update(errors)
+
+        if all_errors:
+            raise IOError(f"Component image discovery failed: {all_errors}")
+
+        # --- Phase 3: Sign release images (with canonical tags) ---
+        self._logger.info(
+            "Signing %d release images with %d total manifests",
+            len(release_images),
+            sum(len(ri.manifests_to_sign) for ri in release_images),
+        )
+        if errors := await signatory.sign_release_images(release_images):
+            raise IOError(f"Release image signing failed: {errors}")
+
+        # --- Phase 4: Sign component images (digest only) ---
+        self._logger.info("Signing %d component images", len(component_images))
+        if errors := await signatory.sign_component_images(component_images):
+            raise IOError(f"Component image signing failed: {errors}")
 
     def publish_baremetal_installer_binary(self, release_pullspec: str, client_mirror_dir: str, build_arch: str):
         _, baremetal_installer_pullspec = get_release_image_pullspec(release_pullspec, 'baremetal-installer')
@@ -1056,7 +1108,7 @@ class PromotePipeline:
 
         # Check rhel version (used for archive naming)
         major, minor = isolate_major_minor_in_group(self.group)
-        if major == 4 and minor < 16:
+        if (major, minor) < (4, 16):
             rhel_version = 'rhel8'
             binary_name = 'openshift-baremetal-install'
         else:
@@ -1252,14 +1304,14 @@ class PromotePipeline:
             return
 
         major, minor = isolate_major_minor_in_group(self.group)
-        if major == 4 and minor < 14:
+        if (major, minor) < (4, 14):
             self._logger.info("Skip microshift build for version < 4.14")
             return
 
         jenkins.start_build_microshift(f'{major}.{minor}', self.assembly, self.runtime.dry_run)
 
     @staticmethod
-    def get_live_id(advisory_info: Dict):
+    def get_full_advisory_id_from_errata_advisory(advisory_info: Dict):
         # Extract live ID from advisory info
         # Examples:
         # - advisory with a live ID
@@ -1277,6 +1329,22 @@ class PromotePipeline:
             return None
         live_id = advisory_info["fulladvisory"].rsplit("-", 1)[0]  # RHBA-2019:2681-02 => RHBA-2019:2681
         return live_id
+
+    @staticmethod
+    def get_full_advisory_id_from_shipment(shipment_config: ShipmentConfig) -> str:
+        """Get the full advisory ID from a shipment config, if it exists."""
+        live_id = shipment_config.shipment.data.releaseNotes.live_id
+        if not live_id:
+            raise ValueError("Could not find live ID in image shipment config!")
+
+        # construct full advisory id like RHBA-2025:13660
+        advisory_type = shipment_config.shipment.data.releaseNotes.type
+        year = datetime.now().strftime("%Y")
+
+        # Important: Pad liveID with 0 if it is less than 4 digits
+        live_id = f"{live_id:04}"
+
+        return f"{advisory_type.upper()}-{year}:{live_id}"
 
     def verify_advisory_status(self, advisory_info: Dict):
         if advisory_info["status"] not in {"QE", "REL_PREP", "PUSH_READY", "IN_PUSH", "SHIPPED_LIVE"}:
@@ -1990,7 +2058,7 @@ class PromotePipeline:
             release_content = upstream_repo.get_contents(file_path, ref="z-stream")
             file_content = yaml.load(release_content.decoded_content)
             file_content['releases'][release_name] = {'advisories': advisories, 'release_jira': release_jira}
-        except ParserError:
+        except (ParserError, TypeError):
             self._logger.warning("release file not in valid yaml format, overwrite with new value")
             file_content = {'releases': {}}
             file_content['releases'][release_name] = {'advisories': advisories, 'release_jira': release_jira}
@@ -2162,13 +2230,12 @@ class PromotePipeline:
         gitlab_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
 
         # Connect to GitLab
-        gl = gitlab.Gitlab(gitlab_url, private_token=gitlab_token)
-        gl.auth()
+        gl = GitLabClient(gitlab_url, gitlab_token, self.runtime.dry_run)
 
         # Load the existing MR
-        project = gl.projects.get(target_project_path)
+        project = gl.get_project(target_project_path)
         mr = project.mergerequests.get(mr_id)
-        source_project = gl.projects.get(mr.source_project_id)
+        source_project = gl.get_project(mr.source_project_id)
 
         # Load shipment configs from MR
         shipments_by_kind = get_shipment_configs_from_mr(shipment_url)
@@ -2198,11 +2265,9 @@ class PromotePipeline:
             else:
                 self._logger.info("No template replacements needed for %s shipment", shipment_kind)
 
-        # Create a single MR with all the file updates
+        # Commit doc updates directly to the shipment MR branch
         if files_to_update:
-            await self._create_consolidated_shipment_update_mr(
-                mr, source_project, files_to_update, templates_replaced_total
-            )
+            await self._update_shipment_mr_with_docs(mr, source_project, files_to_update, templates_replaced_total)
         else:
             self._logger.info("No template replacements needed for any shipment files")
 
@@ -2245,10 +2310,7 @@ class PromotePipeline:
                 and image_shipment.shipment.data.releaseNotes.type
                 and image_shipment.shipment.data.releaseNotes.live_id
             ):
-                advisory_type = image_shipment.shipment.data.releaseNotes.type
-                live_id = image_shipment.shipment.data.releaseNotes.live_id
-                year = datetime.now().strftime("%Y")
-                image_advisory = f"{advisory_type}-{year}:{live_id}"
+                image_advisory = self.get_full_advisory_id_from_shipment(image_shipment)
                 format_dict["IMAGE_ADVISORY"] = image_advisory
                 self._logger.info("Generated IMAGE_ADVISORY: %s", image_advisory)
             else:
@@ -2258,10 +2320,10 @@ class PromotePipeline:
 
         # Generate RPM_ADVISORY template key for all shipment types
         try:
-            rpm_advisory = await self._get_rpm_advisory()
-            if rpm_advisory:
-                format_dict["RPM_ADVISORY"] = rpm_advisory
-                self._logger.info("Generated RPM_ADVISORY: %s", rpm_advisory)
+            rpm_advisory_id = await self._get_rpm_advisory_id()
+            if rpm_advisory_id:
+                format_dict["RPM_ADVISORY"] = rpm_advisory_id
+                self._logger.info("Generated RPM_ADVISORY: %s", rpm_advisory_id)
             else:
                 # Don't replace RPM_ADVISORY placeholder if we can't generate it
                 self._logger.warning("Could not generate RPM_ADVISORY: no RPM advisory found in releases.yml")
@@ -2365,124 +2427,48 @@ class PromotePipeline:
             self._logger.info("No template placeholders found in %s shipment file", shipment_kind)
             return None, None, 0
 
-    async def _create_consolidated_shipment_update_mr(
+    async def _update_shipment_mr_with_docs(
         self, mr, source_project, files_to_update: Dict[str, str], templates_replaced_total: int
     ):
-        """Create a new MR to update all shipments with template replacements"""
+        """
+        Update shipment files with template replacements by committing directly
+        to the shipment MR's source branch.
+        """
         try:
             if self.runtime.dry_run:
                 self._logger.info(
-                    "[DRY RUN] Would have created MR to update shipment files with template replacements: %s",
+                    "[DRY RUN] Would have committed doc updates to shipment MR branch %s: %s",
+                    mr.source_branch,
                     list(files_to_update.keys()),
                 )
                 return None
 
-            # Check if an MR with template updates already exists (reentrant check)
-            sha_mr_title_pattern = f"Update {self.assembly} Docs release notes"
-            existing_mrs = source_project.mergerequests.list(
-                target_branch=mr.source_branch, state='opened', search=sha_mr_title_pattern
-            )
-
-            for existing_mr in existing_mrs:
-                if existing_mr.title == sha_mr_title_pattern:
-                    self._logger.info(
-                        "Payload SHA update MR already exists: %s. Skipping creation.", existing_mr.web_url
-                    )
-                    await self._slack_client.say_in_thread(
-                        f"Payload SHA update MR already exists: {existing_mr.web_url}"
-                    )
-
-                    # Check if comment about this MR already exists on main shipment MR
-                    main_mr_comment = (
-                        f"Docs team, please review the existing MR to update release notes: {existing_mr.web_url}"
-                    )
-                    existing_notes = mr.notes.list(all=True)
-                    comment_exists = any(note.body == main_mr_comment for note in existing_notes)
-
-                    if not comment_exists:
-                        try:
-                            mr.notes.create({'body': main_mr_comment})
-                            self._logger.info("Added comment to main shipment MR")
-                        except Exception as comment_ex:
-                            self._logger.warning("Failed to comment on main shipment MR: %s", comment_ex)
-                    else:
-                        self._logger.info("Comment about payload SHA update MR already exists on main shipment MR")
-
-                    return None
-
-            # Create a new branch for the template updates
-            timestamp = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
-            update_branch = f"update-shas-{self.assembly}-{timestamp}"
-
-            # Create branch from the shipment MR's source branch
-            source_project.branches.create({'branch': update_branch, 'ref': mr.source_branch})
-            self._logger.info("Created template update branch: %s", update_branch)
-
-            # Update all files in the new branch
+            source_branch = mr.source_branch
+            # Update all files directly on the shipment MR's source branch
             for file_path, updated_content in files_to_update.items():
-                file_to_update = source_project.files.get(file_path, update_branch)
+                file_to_update = source_project.files.get(file_path, source_branch)
                 file_to_update.content = updated_content
                 file_to_update.save(
-                    branch=update_branch,
+                    branch=source_branch,
                     commit_message=f"Update {file_path.split('/')[-1]} with payload SHAs for {self.assembly}",
                 )
-                self._logger.info("Updated file %s in branch %s", file_path, update_branch)
+                self._logger.info("Updated file %s in branch %s", file_path, source_branch)
 
-            # Create MR to merge template updates into the shipment MR branch
-            update_mr_title = f"Update {self.assembly} Docs release notes"
-
-            shipment_files = [f"- {file_path.split('/')[-1]}" for file_path in files_to_update.keys()]
-            shipment_files_str = "\n".join(shipment_files)
-
-            update_mr_description = f"""This MR updates shipment configurations with payload SHAs from the successful promote job.
-
-**Release**: {self.assembly}
-**Promote Job**: {os.environ.get('BUILD_URL', 'N/A')}
-**Total Templates Replaced**: {templates_replaced_total}
-
-**Updated Files:**
-{shipment_files_str}
-
-**Updated Templates:**
-- Replaced SHA digest placeholders
-- Updated advisory references
-
-"""
-
-            update_mr = source_project.mergerequests.create(
-                {
-                    'source_branch': update_branch,
-                    'target_branch': mr.source_branch,
-                    'title': update_mr_title,
-                    'description': update_mr_description,
-                    'remove_source_branch': True,
-                }
+            self._logger.info(
+                "Committed doc updates to shipment MR branch %s (%d templates replaced)",
+                source_branch,
+                templates_replaced_total,
+            )
+            await self._slack_client.say_in_thread(
+                f"Updated shipment MR with payload SHAs and advisories: {mr.web_url}"
             )
 
-            update_mr_url = update_mr.web_url
-            self._logger.info("Created consolidated template update MR: %s", update_mr_url)
-
-            # Auto-merge Docs rel notes updates since the Docs team will review and approve the main Shipment MR
-            try:
-                # Wait a moment for GitLab to process the MR
-                await asyncio.sleep(2)
-
-                # Set auto-merge to merge when pipeline passes
-                update_mr = source_project.mergerequests.get(update_mr.id, lazy=False)
-                update_mr.merge(merge_when_pipeline_succeeds=True, should_remove_source_branch=True)
-                self._logger.info("Successfully enabled auto-merge for template update MR: %s", update_mr_url)
-                await self._slack_client.say_in_thread(
-                    f"Enabled auto-merge for MR with payload SHAs (will merge when pipeline passes): {update_mr_url}"
-                )
-            except Exception as merge_ex:
-                self._logger.warning("Failed to enable auto-merge for template update MR: %s", merge_ex)
-                await self._slack_client.say_in_thread(
-                    f"Created MR to update shipment with payload SHAs (auto-merge setup failed): {update_mr_url}"
-                )
-
-            # Comment on the main shipment MR to notify about the template update MR
-            # Since pipeline may take time, always notify docs team about the auto-merge MR
-            main_mr_comment = f"@hybrid-platforms/art/team-docs: Please review the MR to update release notes after it merges (it is set to automerge) and approve the Shipment MR: {update_mr_url}"
+            # Comment on the shipment MR to notify docs team about the updates
+            main_mr_comment = (
+                f"@hybrid-platforms/art/team-docs: Shipment files have been updated with"
+                f" payload SHAs and advisory references ({templates_replaced_total} templates replaced)."
+                f" Please review the updated release notes and approve this Shipment MR."
+            )
 
             # Check if comment already exists to avoid duplicates
             existing_notes = mr.notes.list(all=True)
@@ -2491,17 +2477,17 @@ class PromotePipeline:
             if not comment_exists:
                 try:
                     mr.notes.create({'body': main_mr_comment})
-                    self._logger.info("Added comment to main shipment MR")
+                    self._logger.info("Added comment to shipment MR notifying docs team")
                 except Exception as comment_ex:
-                    self._logger.warning("Failed to comment on main shipment MR: %s", comment_ex)
+                    self._logger.warning("Failed to comment on shipment MR: %s", comment_ex)
             else:
                 self._logger.info("Comment about template update MR already exists on main shipment MR")
 
         except Exception as ex:
-            self._logger.error("Failed to create consolidated template update MR: %s", ex)
+            self._logger.error("Failed to update shipment MR with doc updates: %s", ex)
             raise
 
-    async def _get_rpm_advisory(self) -> Optional[str]:
+    async def _get_rpm_advisory_id(self) -> Optional[str]:
         """Get RPM advisory ID from releases.yml and query errata endpoint for advisory type.
 
         :return: Formatted RPM advisory string like "RHBA-2025:12345" or None if not found
@@ -2535,47 +2521,7 @@ class PromotePipeline:
                 self._logger.info("No RPM advisory ID found for assembly %s", self.assembly)
                 return None
 
-            self._logger.info("Found RPM advisory ID %s for assembly %s", rpm_advisory_id, self.assembly)
-
-            # Query errata endpoint to get advisory type
-            errata_endpoint = "https://errata.devel.redhat.com/api/v1/erratum/{}"
-            errata_url = urlparse(errata_endpoint.format(rpm_advisory_id)).geturl()
-
-            self._logger.info("Querying errata API endpoint: %s", errata_url)
-
-            # Make request to errata endpoint
-            response = requests.get(
-                errata_url,
-                verify=ssl.get_default_verify_paths().openssl_cafile,
-                auth=HTTPSPNEGOAuth(),
-            )
-            response.raise_for_status()
-
-            advisory_data = response.json()
-
-            # Extract advisory type and errata_id from response using similar logic to format_advisory_data
-            advisory_type = None
-            errata_id = None
-            if "errata" in advisory_data:
-                errata_data = advisory_data["errata"]
-                # Get the first (and typically only) advisory type key
-                for key in errata_data:
-                    advisory_type = key
-                    errata_id = errata_data[key].get("errata_id")
-                    break
-
-            if not advisory_type or not errata_id:
-                self._logger.warning(
-                    "Could not extract advisory type or errata_id from errata response for RPM advisory %s",
-                    rpm_advisory_id,
-                )
-                return None
-
-            # Generate the formatted advisory string: {advisory_type}-{year}:{errata_id}
-            year = datetime.now().strftime("%Y")
-            rpm_advisory = f"{advisory_type.upper()}-{year}:{errata_id}"
-
-            return rpm_advisory
+            return get_errata_live_id(rpm_advisory_id)
 
         except Exception as ex:
             self._logger.error("Error getting RPM advisory: %s", ex)

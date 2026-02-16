@@ -25,7 +25,6 @@ from artcommonlib.util import (
     convert_remote_git_to_ssh,
     deep_merge,
     download_file_from_github,
-    remove_prefix,
     split_git_url,
 )
 from artcommonlib.variants import BuildVariant
@@ -102,6 +101,12 @@ class OkdRebaseCli:
             self.logger.info('Using OKD group configuration')
             group_config = deep_merge(group_config, group_config['okd'])
             self.runtime.group_config = Model(group_config)
+
+        # For OKD, we need to use the OKD group variant (e.g., okd-4.20 instead of openshift-4.20)
+        # This ensures the Konflux DB cache is loaded for the correct group
+        major, minor = self.runtime.get_major_minor_fields()
+        self.runtime.group = f'okd-{major}.{minor}'
+        self.logger.info(f'Changed runtime group to OKD variant: {self.runtime.group}')
 
         base_dir = Path(self.runtime.working_dir, constants.WORKING_SUBDIR_KONFLUX_OKD_SOURCES)
         rebaser = KonfluxRebaser(
@@ -256,12 +261,8 @@ def resolve_okd_from_image_meta(runtime, image_meta, okd_version):
     elif ci_alignment_config.upstream_image:
         return ci_alignment_config.upstream_image
     else:
-        name = image_meta.config.payload_name or image_meta.config.name
-        image_name = name.split('/')[-1]
-        # In release payloads, images are promoted into an imagestream
-        # tag name without the ose- prefix.
-        image_name = remove_prefix(image_name, 'ose-')
-        ci_payload_tag_name = image_name
+        # Use the same payload tag name logic as OCP, which properly handles payload_name
+        ci_payload_tag_name = get_okd_payload_tag_name(image_meta)
 
     # e.g. registry.ci.openshift.org/origin/scos-4.16:base
     return f'registry.ci.openshift.org/origin/scos-{okd_version}:{ci_payload_tag_name}'

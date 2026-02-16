@@ -17,17 +17,13 @@ from artcommonlib.konflux.konflux_db import KonfluxDb
 from artcommonlib.release_util import split_el_suffix_in_release
 from artcommonlib.rpm_utils import parse_nvr
 from artcommonlib.util import new_roundtrip_yaml_handler
-from doozerlib.brew import watch_task_async
 from elliottlib import util as elliottutil
 from elliottlib.constants import GOLANG_BUILDER_CVE_COMPONENT
 from ghapi.all import GhApi
-from github import Github, GithubException
-from ruamel.yaml import YAML
+from github import Github
 
 from pyartcd import constants, jenkins
 from pyartcd.cli import cli, click_coroutine, pass_runtime
-from pyartcd.constants import GITHUB_OWNER
-from pyartcd.git import GitRepository
 from pyartcd.runtime import Runtime
 
 _LOGGER = logging.getLogger(__name__)
@@ -81,9 +77,7 @@ def extract_and_validate_golang_nvrs(ocp_version: str, go_nvrs: List[str]):
     if not match:
         raise ValueError(f'Invalid OCP version: {ocp_version}')
     major, minor = int(match[1]), int(match[2])
-    if major != 4:
-        raise ValueError(f'Only OCP major version 4 is supported, found: {major}')
-    if minor < 12:
+    if (major, minor) < (4, 12):
         raise ValueError(f'Only OCP 4.12+ is supported, found: {ocp_version}')
 
     # only rhel 8 and 9 are supported 4.12 onwards
@@ -270,7 +264,11 @@ class UpdateGolangPipeline:
             if self.build_system in ['both', 'konflux'] and konflux_missing:
                 build_tasks.extend([self._rebase_and_build_konflux(el_v, go_version) for el_v in konflux_missing])
             if build_tasks:
-                await asyncio.gather(*build_tasks)
+                results = await asyncio.gather(*build_tasks, return_exceptions=True)
+            errors = [r for r in results if isinstance(r, Exception)]
+            if errors:
+                error_msgs = "\n".join([str(e) for e in errors])
+                raise RuntimeError(f"{len(errors)} image build(s) failed:\n{error_msgs}")
 
             # Now all builders should be available, try to fetch again
             if self.build_system in ['both', 'brew']:

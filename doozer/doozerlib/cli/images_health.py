@@ -84,12 +84,12 @@ class ImagesHealthPipeline:
         # Filter out images that are disabled for this variant
         for image_meta in self.runtime.image_metas():
             if self.variant is BuildVariant.OKD:
-                # Skip images with okd.mode: disabled
-                if (
-                    image_meta.config.okd is not Missing
-                    and image_meta.config.okd.mode is not Missing
-                    and image_meta.config.okd.mode == 'disabled'
-                ):
+                # For OKD variant, determine effective mode: okd.mode overrides general mode
+                effective_mode = image_meta.mode  # Default to general mode
+                if image_meta.config.okd is not Missing and image_meta.config.okd.mode is not Missing:
+                    effective_mode = image_meta.config.okd.mode  # Override with OKD-specific mode if present
+
+                if effective_mode == 'disabled':
                     self.logger.info('Skipping OKD disabled image: %s', image_meta.distgit_key)
                     continue
             elif image_meta.config.konflux.mode == 'disabled' or image_meta.mode == 'disabled':
@@ -160,8 +160,9 @@ class ImagesHealthPipeline:
                 ),
             )
 
-        if latest_success_idx <= 3:
+        elif self.variant is not BuildVariant.OKD and latest_success_idx <= 3:
             # The latest attempt was a failure, but there was a success within the last 3 attempts: skip notification
+            # Note: For OKD, we always notify on first failure, so this check is skipped
             self.logger.info(
                 f'Latest attempt for {image_meta.distgit_key} failed, but the one before it succeeded, skipping notification.'
             )
@@ -225,7 +226,7 @@ class ImagesHealthPipeline:
 @click_coroutine
 @pass_runtime
 async def images_health(runtime, limit, group, assembly, variant):
-    runtime.initialize(clone_distgits=False, clone_source=False)
+    runtime.initialize(clone_distgits=False, clone_source=False, prevent_cloning=True)
     await ImagesHealthPipeline(
         runtime=runtime, limit=limit, group=group, assembly=assembly, variant=BuildVariant(variant)
     ).run()

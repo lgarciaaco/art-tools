@@ -178,26 +178,64 @@ class TestUtil(unittest.TestCase):
         util.oc_image_info_for_arch__caching('pullspec')
         gather_mock.assert_called_with(['oc', 'image', 'info', '-o', 'json', 'pullspec', '--filter-by-os=amd64'])
 
-    @patch("artcommonlib.exectools.cmd_gather")
-    def test_oc_image_info_for_arch_strict_false_manifest_unknown(self, gather_mock):
+    @patch("doozerlib.util.oc_image_info")
+    def test_oc_image_info_for_arch_strict_false_manifest_unknown(self, oc_image_info_mock):
         # When strict=False and manifest unknown, should return None
-        gather_mock.return_value = (1, '', 'error: manifest unknown: manifest unknown')
+        oc_image_info_mock.return_value = None
         result = util.oc_image_info_for_arch('pullspec', strict=False)
         self.assertIsNone(result)
+        oc_image_info_mock.assert_called_once_with(
+            'pullspec', '--filter-by-os=amd64', registry_config=None, strict=False
+        )
 
-    @patch("artcommonlib.exectools.cmd_gather")
-    def test_oc_image_info_for_arch_strict_false_other_error(self, gather_mock):
+    @patch("doozerlib.util.oc_image_info")
+    def test_oc_image_info_for_arch_strict_false_other_error(self, oc_image_info_mock):
         # When strict=False but other error, should raise
-        gather_mock.return_value = (1, '', 'error: network timeout')
+        oc_image_info_mock.side_effect = IOError("oc image info failed (rc=1): error: network timeout")
         with self.assertRaises(IOError):
             util.oc_image_info_for_arch('pullspec', strict=False)
 
-    @patch("artcommonlib.exectools.cmd_gather")
-    def test_oc_image_info_for_arch_strict_true_manifest_unknown(self, gather_mock):
+    @patch("doozerlib.util.oc_image_info")
+    def test_oc_image_info_for_arch_strict_true_manifest_unknown(self, oc_image_info_mock):
         # When strict=True and manifest unknown, should raise
-        gather_mock.return_value = (1, '', 'error: manifest unknown: manifest unknown')
+        oc_image_info_mock.side_effect = IOError(
+            "oc image info failed (rc=1): error: manifest unknown: manifest unknown"
+        )
         with self.assertRaises(IOError):
             util.oc_image_info_for_arch('pullspec', strict=True)
+
+    def test_get_cincinnati_channels_ocp_4_1(self):
+        # OCP 4.1 uses special channel names (prerelease, stable)
+        channels = util.get_cincinnati_channels(4, 1)
+        self.assertEqual(channels, ['prerelease-4.1', 'stable-4.1'])
+
+    def test_get_cincinnati_channels_ocp_4_x(self):
+        # OCP 4.2+ uses standard channel names
+        channels = util.get_cincinnati_channels(4, 16)
+        self.assertEqual(channels, ['candidate-4.16', 'fast-4.16', 'stable-4.16'])
+
+        channels = util.get_cincinnati_channels(4, 22)
+        self.assertEqual(channels, ['candidate-4.22', 'fast-4.22', 'stable-4.22'])
+
+    def test_get_cincinnati_channels_ocp_5_x(self):
+        # OCP 5.x uses standard channel names (same as 4.2+)
+        channels = util.get_cincinnati_channels(5, 0)
+        self.assertEqual(channels, ['candidate-5.0', 'fast-5.0', 'stable-5.0'])
+
+        channels = util.get_cincinnati_channels(5, 5)
+        self.assertEqual(channels, ['candidate-5.5', 'fast-5.5', 'stable-5.5'])
+
+    def test_get_cincinnati_channels_string_versions(self):
+        # Function should handle string inputs (converts to int)
+        channels = util.get_cincinnati_channels('5', '0')
+        self.assertEqual(channels, ['candidate-5.0', 'fast-5.0', 'stable-5.0'])
+
+    def test_get_cincinnati_channels_rejects_ocp_3(self):
+        # Cincinnati channels don't exist for OCP 3.x and earlier
+        with self.assertRaises(ValueError) as ctx:
+            util.get_cincinnati_channels(3, 11)
+        self.assertIn('Cincinnati channels are only available for OCP 4.x and later', str(ctx.exception))
+        self.assertIn('3.11', str(ctx.exception))
 
 
 if __name__ == "__main__":

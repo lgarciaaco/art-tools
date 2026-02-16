@@ -1,15 +1,15 @@
 import os
-import shutil
 import tempfile
-from datetime import datetime
 from pathlib import Path
 from unittest import IsolatedAsyncioTestCase
-from unittest.mock import ANY, AsyncMock, MagicMock, Mock, PropertyMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, Mock, patch
 
 from artcommonlib.assembly import AssemblyTypes
 from artcommonlib.exceptions import VerificationError
+from artcommonlib.jira_config import JIRA_SERVER_URL
 from artcommonlib.model import Model
 from pyartcd.pipelines.promote import PromotePipeline
+from ruamel.yaml import YAML
 
 
 class TestPromotePipeline(IsolatedAsyncioTestCase):
@@ -127,7 +127,7 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
                     "ocp_build_data_url": "https://example.com/ocp-build-data.git",
                 },
                 "jira": {
-                    "url": "https://issues.redhat.com/",
+                    "url": JIRA_SERVER_URL,
                 },
             },
             working_dir=Path("/path/to/working"),
@@ -158,7 +158,7 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
                     "ocp_build_data_url": "https://example.com/ocp-build-data.git",
                 },
                 "jira": {
-                    "url": "https://issues.redhat.com/",
+                    "url": JIRA_SERVER_URL,
                 },
             },
             working_dir=Path("/path/to/working"),
@@ -191,7 +191,7 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
                     "ocp_build_data_url": "https://example.com/ocp-build-data.git",
                 },
                 "jira": {
-                    "url": "https://issues.redhat.com/",
+                    "url": JIRA_SERVER_URL,
                 },
             },
             working_dir=Path("/path/to/working"),
@@ -259,7 +259,7 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
                     "ocp_build_data_url": "https://example.com/ocp-build-data.git",
                 },
                 "jira": {
-                    "url": "https://issues.redhat.com/",
+                    "url": JIRA_SERVER_URL,
                 },
             },
             working_dir=Path("/path/to/working"),
@@ -331,7 +331,7 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
                     "ocp_build_data_url": "https://example.com/ocp-build-data.git",
                 },
                 "jira": {
-                    "url": "https://issues.redhat.com/",
+                    "url": JIRA_SERVER_URL,
                 },
             },
             working_dir=Path("/path/to/working"),
@@ -371,7 +371,7 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
                     "ocp_build_data_url": "https://example.com/ocp-build-data.git",
                 },
                 "jira": {
-                    "url": "https://issues.redhat.com/",
+                    "url": JIRA_SERVER_URL,
                 },
             },
             working_dir=Path("/path/to/working"),
@@ -413,7 +413,7 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
                     "ocp_build_data_url": "https://example.com/ocp-build-data.git",
                 },
                 "jira": {
-                    "url": "https://issues.redhat.com/",
+                    "url": JIRA_SERVER_URL,
                 },
             },
             working_dir=Path("/path/to/working"),
@@ -463,7 +463,7 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
                     "ocp_build_data_url": "https://example.com/ocp-build-data.git",
                 },
                 "jira": {
-                    "url": "https://issues.redhat.com/",
+                    "url": JIRA_SERVER_URL,
                 },
             },
             working_dir=Path("/path/to/working"),
@@ -569,7 +569,7 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
                     "ocp_build_data_url": "https://example.com/ocp-build-data.git",
                 },
                 "jira": {
-                    "url": "https://issues.redhat.com/",
+                    "url": JIRA_SERVER_URL,
                 },
             },
             working_dir=Path("/path/to/working"),
@@ -728,7 +728,7 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
                     "ocp_build_data_url": "https://example.com/ocp-build-data.git",
                 },
                 "jira": {
-                    "url": "https://issues.redhat.com/",
+                    "url": JIRA_SERVER_URL,
                 },
             },
             working_dir=Path("/path/to/working"),
@@ -842,7 +842,7 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
                     "ocp_build_data_url": "https://example.com/ocp-build-data.git",
                 },
                 "jira": {
-                    "url": "https://issues.redhat.com/",
+                    "url": JIRA_SERVER_URL,
                 },
             },
             working_dir=Path("/path/to/working"),
@@ -951,7 +951,7 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
         runtime = MagicMock(
             config={
                 "build_config": {"ocp_build_data_url": "https://example.com/ocp-build-data.git"},
-                "jira": {"url": "https://issues.redhat.com/"},
+                "jira": {"url": JIRA_SERVER_URL},
             },
             working_dir=Path("/path/to/working"),
             dry_run=False,
@@ -1082,7 +1082,7 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
                     "ocp_build_data_url": "https://example.com/ocp-build-data.git",
                 },
                 "jira": {
-                    "url": "https://issues.redhat.com/",
+                    "url": JIRA_SERVER_URL,
                 },
             },
             working_dir=Path("/path/to/working"),
@@ -1380,7 +1380,7 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
                     "ocp_build_data_url": "https://example.com/ocp-build-data.git",
                 },
                 "jira": {
-                    "url": "https://issues.redhat.com/",
+                    "url": JIRA_SERVER_URL,
                 },
             },
             working_dir=Path("/path/to/working"),
@@ -1606,7 +1606,7 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
                     "ocp_build_data_url": "https://example.com/ocp-build-data.git",
                 },
                 "jira": {
-                    "url": "https://issues.redhat.com/",
+                    "url": JIRA_SERVER_URL,
                 },
             },
             working_dir=Path("/path/to/working"),
@@ -1655,7 +1655,7 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
                     "ocp_build_data_url": "https://example.com/ocp-build-data.git",
                 },
                 "jira": {
-                    "url": "https://issues.redhat.com/",
+                    "url": JIRA_SERVER_URL,
                 },
             },
             working_dir=Path("/path/to/working"),
@@ -1709,7 +1709,7 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
                     "ocp_build_data_url": "https://example.com/ocp-build-data.git",
                 },
                 "jira": {
-                    "url": "https://issues.redhat.com/",
+                    "url": JIRA_SERVER_URL,
                 },
             },
             working_dir=Path("/path/to/working"),
@@ -1769,7 +1769,7 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
                     "ocp_build_data_url": "https://example.com/ocp-build-data.git",
                 },
                 "jira": {
-                    "url": "https://issues.redhat.com/",
+                    "url": JIRA_SERVER_URL,
                 },
             },
             working_dir=Path("/path/to/working"),
@@ -1837,7 +1837,7 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
                     "ocp_build_data_url": "https://example.com/ocp-build-data.git",
                 },
                 "jira": {
-                    "url": "https://issues.redhat.com/",
+                    "url": JIRA_SERVER_URL,
                 },
             },
             working_dir=Path("/path/to/working"),
@@ -1913,7 +1913,7 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
                     "ocp_build_data_url": "https://example.com/ocp-build-data.git",
                 },
                 "jira": {
-                    "url": "https://issues.redhat.com/",
+                    "url": JIRA_SERVER_URL,
                 },
             },
             working_dir=Path("/path/to/working"),
@@ -1949,7 +1949,7 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
 
     @patch("pyartcd.jira_client.JIRAClient.from_url", return_value=None)
     @patch("pyartcd.pipelines.promote.get_shipment_configs_from_mr")
-    @patch("pyartcd.pipelines.promote.gitlab.Gitlab")
+    @patch("artcommonlib.gitlab.gitlab.Gitlab")
     @patch("os.getenv")
     async def test_update_shipment_with_payload_shas_no_image_shipment(
         self, mock_getenv: Mock, mock_gitlab_class: Mock, mock_get_shipment_configs: Mock, _
@@ -1981,4 +1981,70 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
         # Should log warning about missing IMAGE_ADVISORY generation
         runtime.logger.warning.assert_any_call(
             "Cannot generate IMAGE_ADVISORY: missing image shipment or type/live_id data"
+        )
+
+    @patch("pyartcd.jira_client.JIRAClient.from_url", return_value=None)
+    @patch("pyartcd.pipelines.promote.Github")
+    @patch.dict(os.environ, {"GITHUB_TOKEN": "fake-token"})
+    async def test_update_qe_repo_releases_is_none(self, mock_github_class: Mock, _):
+        """
+        Test _update_qe_repo handles TypeError when YAML contains 'releases:' with no value.
+        When yaml.load returns {'releases': None}, attempting file_content['releases'][release_name]
+        raises TypeError: 'NoneType' object does not support item assignment.
+        """
+        # given
+        runtime = MagicMock()
+        runtime.working_dir = Path("/tmp")
+        runtime.dry_run = False
+
+        pipeline = PromotePipeline(runtime, group="openshift-4.21", assembly="4.21.0", signing_env="prod")
+
+        mock_github = MagicMock()
+        mock_github_class.return_value = mock_github
+        mock_upstream_repo = MagicMock()
+        mock_fork_repo = MagicMock()
+        mock_github.get_repo.side_effect = lambda repo: (
+            mock_upstream_repo if repo == "openshift/release-tests" else mock_fork_repo
+        )
+
+        mock_fork_repo.get_branches.return_value = []
+        mock_upstream_branch = MagicMock()
+        mock_upstream_branch.commit.sha = "fake-sha"
+        mock_upstream_repo.get_branch.return_value = mock_upstream_branch
+        mock_fork_branch = MagicMock()
+        mock_fork_branch.ref = "refs/heads/4.21.0"
+        mock_fork_repo.create_git_ref.return_value = mock_fork_branch
+
+        mock_release_content = MagicMock()
+        mock_release_content.decoded_content = b"releases:"
+        mock_upstream_repo.get_contents.return_value = mock_release_content
+
+        mock_fork_file = MagicMock()
+        mock_fork_file.sha = "file-sha"
+        mock_fork_repo.get_contents.return_value = mock_fork_file
+
+        # when
+        pipeline._update_qe_repo(
+            release_name="4.21.0", release_jira="ART-1234", advisories={"image": 12345, "rpm": 67890}
+        )
+
+        # then
+        mock_fork_repo.update_file.assert_called_once()
+        pipeline._logger.warning.assert_called_with("release file not in valid yaml format, overwrite with new value")
+
+        call_args = mock_fork_repo.update_file.call_args
+        written_content = call_args[0][2]  # Third positional argument is the content
+
+        parsed_content = YAML(typ="safe").load(written_content)
+
+        self.assertEqual(
+            parsed_content,
+            {
+                "releases": {
+                    "4.21.0": {
+                        "advisories": {"image": 12345, "rpm": 67890},
+                        "release_jira": "ART-1234",
+                    },
+                }
+            },
         )

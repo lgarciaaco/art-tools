@@ -1,11 +1,7 @@
-import asyncio
-import os
 import unittest
-from unittest.mock import AsyncMock, patch
 
 import yaml
 from artcommonlib import build_util, release_util, util
-from artcommonlib.constants import KONFLUX_DEFAULT_NAMESPACE
 from artcommonlib.model import Model
 from artcommonlib.release_util import SoftwareLifecyclePhase
 from artcommonlib.util import (
@@ -393,6 +389,103 @@ class TestNormalizeGroupNameForK8s(unittest.TestCase):
         """Test group name with numbers"""
         result = normalize_group_name_for_k8s("group123-4.56")
         self.assertEqual(result, "group123-4-56")
+
+
+class TestArtImageRepoHelpers(unittest.TestCase):
+    """Tests for get_art_prod_image_repo_for_version"""
+
+    def test_get_art_image_repo_ocp_4_dev(self):
+        """Test OCP 4.x dev repository"""
+        repo = util.get_art_prod_image_repo_for_version(4, "dev")
+        self.assertEqual(repo, "quay.io/openshift-release-dev/ocp-v4.0-art-dev")
+
+    def test_get_art_image_repo_ocp_5_dev(self):
+        """Test OCP 5.x dev repository"""
+        repo = util.get_art_prod_image_repo_for_version(5, "dev")
+        self.assertEqual(repo, "quay.io/openshift-release-dev/ocp-v5.0-art-dev")
+
+    def test_get_art_image_repo_ocp_5_dev_priv(self):
+        """Test OCP 5.x private dev repository"""
+        repo = util.get_art_prod_image_repo_for_version(5, "dev-priv")
+        self.assertEqual(repo, "quay.io/openshift-release-dev/ocp-v5.0-art-dev-priv")
+
+    def test_get_art_image_repo_ocp_4_prev(self):
+        """Test OCP 4.x prev repository"""
+        repo = util.get_art_prod_image_repo_for_version(4, "prev")
+        self.assertEqual(repo, "quay.io/openshift-release-dev/ocp-v4.0-art-prev")
+
+    def test_get_art_image_repo_ocp_4_test(self):
+        """Test OCP 4.x test repository"""
+        repo = util.get_art_prod_image_repo_for_version(4, "test")
+        self.assertEqual(repo, "quay.io/openshift-release-dev/ocp-v4.0-art-test")
+
+    def test_get_art_image_repo_rejects_ocp_3(self):
+        """Test that OCP 3.x is rejected"""
+        with self.assertRaises(ValueError) as ctx:
+            util.get_art_prod_image_repo_for_version(3, "dev")
+        self.assertIn("ART image repos only exist for OCP 4.x and later", str(ctx.exception))
+        self.assertIn("3.x", str(ctx.exception))
+
+    def test_get_art_image_repo_invalid_repo_type(self):
+        """Test invalid repo_type parameter"""
+        with self.assertRaises(ValueError) as ctx:
+            util.get_art_prod_image_repo_for_version(4, "invalid")
+        self.assertIn("Invalid repo_type", str(ctx.exception))
+        self.assertIn("invalid", str(ctx.exception))
+
+
+class TestKonfluxImagestreamOverride(unittest.TestCase):
+    """Tests for uses_konflux_imagestream_override"""
+
+    def test_versions_below_4_12(self):
+        """Test versions below 4.12 return False"""
+        self.assertFalse(util.uses_konflux_imagestream_override("4.11"))
+        self.assertFalse(util.uses_konflux_imagestream_override("4.10"))
+        self.assertFalse(util.uses_konflux_imagestream_override("4.0"))
+        self.assertFalse(util.uses_konflux_imagestream_override("3.11"))
+        self.assertFalse(util.uses_konflux_imagestream_override("3.0"))
+
+    def test_version_4_12(self):
+        """Test version 4.12 returns True (boundary)"""
+        self.assertTrue(util.uses_konflux_imagestream_override("4.12"))
+
+    def test_versions_above_4_12(self):
+        """Test versions above 4.12 return True"""
+        self.assertTrue(util.uses_konflux_imagestream_override("4.13"))
+        self.assertTrue(util.uses_konflux_imagestream_override("4.14"))
+        self.assertTrue(util.uses_konflux_imagestream_override("4.15"))
+        self.assertTrue(util.uses_konflux_imagestream_override("4.16"))
+        self.assertTrue(util.uses_konflux_imagestream_override("4.17"))
+        self.assertTrue(util.uses_konflux_imagestream_override("4.18"))
+        self.assertTrue(util.uses_konflux_imagestream_override("4.19"))
+        self.assertTrue(util.uses_konflux_imagestream_override("4.20"))
+        self.assertTrue(util.uses_konflux_imagestream_override("4.21"))
+        self.assertTrue(util.uses_konflux_imagestream_override("4.22"))
+
+    def test_ocp_5_versions(self):
+        """Test all OCP 5.x versions return True"""
+        self.assertTrue(util.uses_konflux_imagestream_override("5.0"))
+        self.assertTrue(util.uses_konflux_imagestream_override("5.1"))
+        self.assertTrue(util.uses_konflux_imagestream_override("5.10"))
+        self.assertTrue(util.uses_konflux_imagestream_override("5.99"))
+
+    def test_future_major_versions(self):
+        """Test future major versions return True"""
+        self.assertTrue(util.uses_konflux_imagestream_override("6.0"))
+        self.assertTrue(util.uses_konflux_imagestream_override("10.0"))
+
+    def test_invalid_versions(self):
+        """Test invalid version strings raise ValueError"""
+        with self.assertRaises(ValueError):
+            util.uses_konflux_imagestream_override("invalid")
+        with self.assertRaises(ValueError):
+            util.uses_konflux_imagestream_override("4")
+        with self.assertRaises(ValueError):
+            util.uses_konflux_imagestream_override("4.12.1")
+        with self.assertRaises(ValueError):
+            util.uses_konflux_imagestream_override("")
+        with self.assertRaises(ValueError):
+            util.uses_konflux_imagestream_override("openshift-4.12")
 
 
 # Legacy group-based resolver tests removed - functions no longer exist

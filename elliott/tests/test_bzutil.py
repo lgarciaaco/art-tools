@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from unittest import mock
 
 import requests
+from artcommonlib.jira_config import JIRA_SERVER_URL, get_jira_browse_url
 from elliottlib import bzutil, constants, exceptions
 from elliottlib.bzutil import Bug, BugTracker, BugzillaBug, BugzillaBugTracker, JIRABug, JIRABugTracker
 from flexmock import flexmock
@@ -111,10 +112,15 @@ class TestBugTracker(unittest.TestCase):
 class TestJIRABugTracker(unittest.TestCase):
     def test_get_config(self):
         config = {'foo': 1, 'jira_config': {'bar': 2}}
+        vars_mock = flexmock(MAJOR="4", MINOR="9")
         runtime = flexmock(
-            gitdata=flexmock(load_data=flexmock(data=config)),
-            get_major_minor=lambda: (4, 9),
+            group_config=flexmock(vars=vars_mock),
+            gitdata=flexmock(),
         )
+        runtime.gitdata.should_receive("load_data").with_args(key='bug', replace_vars=vars_mock).and_return(
+            flexmock(data=config)
+        )
+
         actual = JIRABugTracker.get_config(runtime)
         expected = {'foo': 1, 'bar': 2}
         self.assertEqual(actual, expected)
@@ -122,7 +128,7 @@ class TestJIRABugTracker(unittest.TestCase):
     def test_security_filtering_in_query(self):
         """Test that security filtering is included in JQL query when enabled"""
         # Create a minimal tracker for testing
-        config = {'project': 'OCPBUGS', 'server': 'https://issues.redhat.com'}
+        config = {'project': 'OCPBUGS', 'server': JIRA_SERVER_URL}
         mock_jira_client = flexmock()
         flexmock(JIRABugTracker).should_receive("login").and_return(mock_jira_client)
         flexmock(JIRABugTracker).should_receive("_init_fields")
@@ -144,7 +150,7 @@ class TestJIRABugTracker(unittest.TestCase):
     def test_search_with_security_filtering(self):
         """Test that search results respect security filtering"""
         # Mock configuration
-        config = {'project': 'OCPBUGS', 'server': 'https://issues.redhat.com', 'token_auth': 'mock_token'}
+        config = {'project': 'OCPBUGS', 'server': JIRA_SERVER_URL, 'token_auth': 'mock_token'}
 
         # Create mock issues with different security levels
         mock_security_allowed = flexmock(name="Red Hat Employee")
@@ -160,7 +166,7 @@ class TestJIRABugTracker(unittest.TestCase):
                 security=mock_security_allowed,
                 project=flexmock(key='OCPBUGS'),
             ),
-            permalink=lambda: 'https://issues.redhat.com/browse/OCPBUGS-11111',
+            permalink=lambda: get_jira_browse_url('OCPBUGS-11111'),
         )
 
         mock_issue_disallowed = flexmock(
@@ -173,7 +179,7 @@ class TestJIRABugTracker(unittest.TestCase):
                 security=mock_security_disallowed,
                 project=flexmock(key='OCPBUGS'),
             ),
-            permalink=lambda: 'https://issues.redhat.com/browse/OCPBUGS-22222',
+            permalink=lambda: get_jira_browse_url('OCPBUGS-22222'),
         )
 
         # Mock JIRA client search - should only return allowed bugs when filtering is enabled
@@ -209,14 +215,175 @@ class TestJIRABugTracker(unittest.TestCase):
         self.assertIn('OCPBUGS-11111', bug_ids)
         self.assertIn('OCPBUGS-22222', bug_ids)
 
+    def test_get_available_target_versions(self):
+        """Test fetching available target versions from JIRA"""
+        config = {'project': 'OCPBUGS', 'server': JIRA_SERVER_URL}
+
+        # Mock issue types response (JIRA returns objects, not dicts)
+        bug_type = flexmock(id='1', name='Bug')
+        story_type = flexmock(id='2', name='Story')
+        mock_issue_types = [bug_type, story_type]
+
+        # Mock fields response with Target Version field
+        version1 = flexmock(name='4.17.0')
+        version2 = flexmock(name='4.17.z')
+        version3 = flexmock(name='4.18.0')
+        version4 = flexmock(name='4.18.z')
+
+        field = flexmock(fieldId='customfield_12319940', allowedValues=[version1, version2, version3, version4])
+        mock_fields = [field]
+
+        mock_jira_client = flexmock()
+        mock_jira_client.should_receive('project_issue_types').with_args('OCPBUGS').and_return(mock_issue_types)
+        mock_jira_client.should_receive('project_issue_fields').with_args('OCPBUGS', '1').and_return(mock_fields)
+
+        flexmock(JIRABugTracker).should_receive('login').and_return(mock_jira_client)
+        flexmock(JIRABugTracker).should_receive('_init_fields')
+
+        tracker = JIRABugTracker(config)
+        available_versions = tracker._get_available_target_versions()
+
+        self.assertEqual(len(available_versions), 4)
+        self.assertIn('4.17.0', available_versions)
+        self.assertIn('4.17.z', available_versions)
+        self.assertIn('4.18.0', available_versions)
+        self.assertIn('4.18.z', available_versions)
+
+        # Test caching - should not call API methods again
+        available_versions_2 = tracker._get_available_target_versions()
+        self.assertEqual(available_versions, available_versions_2)
+
+    def test_get_available_target_versions_error_handling(self):
+        """Test error handling when fetching target versions fails"""
+        config = {'project': 'OCPBUGS', 'server': JIRA_SERVER_URL}
+
+        mock_jira_client = flexmock()
+        mock_jira_client.should_receive('project_issue_types').and_raise(Exception('API error'))
+
+        flexmock(JIRABugTracker).should_receive('login').and_return(mock_jira_client)
+        flexmock(JIRABugTracker).should_receive('_init_fields')
+
+        tracker = JIRABugTracker(config)
+        available_versions = tracker._get_available_target_versions()
+
+        # Should return empty list on error
+        self.assertEqual(available_versions, [])
+
+    def test_query_with_valid_target_versions(self):
+        """Test _query filters target versions correctly when all are valid"""
+        config = {'project': 'OCPBUGS', 'server': JIRA_SERVER_URL, 'target_release': ['4.17.0', '4.17.z']}
+
+        mock_jira_client = flexmock()
+        flexmock(JIRABugTracker).should_receive('login').and_return(mock_jira_client)
+        flexmock(JIRABugTracker).should_receive('_init_fields')
+
+        tracker = JIRABugTracker(config)
+
+        # Mock available versions
+        flexmock(tracker).should_receive('_get_available_target_versions').and_return(['4.17.0', '4.17.z', '4.18.0'])
+
+        query = tracker._query(status=['NEW'], target_release=['4.17.0', '4.17.z'], with_target_release=False)
+
+        # Both versions should be included in the query
+        self.assertIn('4.17.0', query)
+        self.assertIn('4.17.z', query)
+        self.assertIn('"Target Version" in', query)
+
+    def test_query_with_invalid_target_versions(self):
+        """Test _query filters out non-existent target versions"""
+        config = {'project': 'OCPBUGS', 'server': JIRA_SERVER_URL, 'target_release': ['4.17.0', '4.20.0']}
+
+        mock_jira_client = flexmock()
+        flexmock(JIRABugTracker).should_receive('login').and_return(mock_jira_client)
+        flexmock(JIRABugTracker).should_receive('_init_fields')
+
+        tracker = JIRABugTracker(config)
+
+        # Mock available versions - 4.20.0 does not exist
+        flexmock(tracker).should_receive('_get_available_target_versions').and_return(['4.17.0', '4.17.z', '4.18.0'])
+
+        query = tracker._query(status=['NEW'], target_release=['4.17.0', '4.20.0'], with_target_release=False)
+
+        # Only 4.17.0 should be included, 4.20.0 should be filtered out
+        self.assertIn('4.17.0', query)
+        self.assertNotIn('4.20.0', query)
+        self.assertIn('"Target Version" in', query)
+
+    def test_query_with_all_invalid_target_versions(self):
+        """Test _query behavior when all target versions are invalid"""
+        config = {'project': 'OCPBUGS', 'server': JIRA_SERVER_URL, 'target_release': ['4.20.0', '4.21.0']}
+
+        mock_jira_client = flexmock()
+        flexmock(JIRABugTracker).should_receive('login').and_return(mock_jira_client)
+        flexmock(JIRABugTracker).should_receive('_init_fields')
+
+        tracker = JIRABugTracker(config)
+
+        # Mock available versions - neither 4.20.0 nor 4.21.0 exist
+        flexmock(tracker).should_receive('_get_available_target_versions').and_return(['4.17.0', '4.17.z', '4.18.0'])
+
+        query = tracker._query(status=['NEW'], target_release=['4.20.0', '4.21.0'], with_target_release=False)
+
+        # Should return None when all target versions are filtered out
+        self.assertIsNone(query)
+
+    def test_query_when_available_versions_fetch_fails(self):
+        """Test _query proceeds with original query when fetching available versions fails"""
+        config = {'project': 'OCPBUGS', 'server': JIRA_SERVER_URL, 'target_release': ['4.17.0']}
+
+        mock_jira_client = flexmock()
+        flexmock(JIRABugTracker).should_receive('login').and_return(mock_jira_client)
+        flexmock(JIRABugTracker).should_receive('_init_fields')
+
+        tracker = JIRABugTracker(config)
+
+        # Mock available versions returning empty list (error case)
+        flexmock(tracker).should_receive('_get_available_target_versions').and_return([])
+
+        query = tracker._query(status=['NEW'], target_release=['4.17.0'], with_target_release=False)
+
+        # Should proceed with original query including the target version
+        self.assertIn('4.17.0', query)
+        self.assertIn('"Target Version" in', query)
+
+    def test_search_returns_empty_when_all_versions_filtered(self):
+        """Test that search methods return empty list when all target versions are filtered out"""
+        config = {'project': 'OCPBUGS', 'server': JIRA_SERVER_URL, 'target_release': ['4.99.0']}
+
+        mock_jira_client = flexmock()
+        flexmock(JIRABugTracker).should_receive('login').and_return(mock_jira_client)
+        flexmock(JIRABugTracker).should_receive('_init_fields')
+
+        tracker = JIRABugTracker(config)
+
+        # Mock available versions - 4.99.0 doesn't exist
+        flexmock(tracker).should_receive('_get_available_target_versions').and_return(['4.17.0', '4.17.z'])
+
+        # Test search method
+        result = tracker.search(['NEW'])
+        self.assertEqual(result, [])
+
+        # Test blocker_search method
+        result = tracker.blocker_search(['NEW'])
+        self.assertEqual(result, [])
+
+        # Test cve_tracker_search method
+        result = tracker.cve_tracker_search(['NEW'])
+        self.assertEqual(result, [])
+
 
 class TestBugzillaBugTracker(unittest.TestCase):
     def test_get_config(self):
         config = {'foo': 1, 'bugzilla_config': {'bar': 2}}
+        vars_mock = flexmock(MAJOR="4", MINOR="9")
         runtime = flexmock(
-            gitdata=flexmock(load_data=flexmock(data=config)),
-            get_major_minor=lambda: (4, 9),
+            group_config=flexmock(vars=vars_mock),
+            gitdata=flexmock(),
         )
+        runtime.gitdata.should_receive("load_data").with_args(key='bug', replace_vars=vars_mock).and_return(
+            flexmock(data=config)
+        )
+
         actual = BugzillaBugTracker.get_config(runtime)
         expected = {'foo': 1, 'bar': 2}
         self.assertEqual(actual, expected)

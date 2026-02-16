@@ -1,5 +1,4 @@
 import asyncio
-import json
 import re
 import sys
 from datetime import datetime
@@ -10,12 +9,16 @@ import requests
 from artcommonlib import exectools, rhcos
 from artcommonlib.arch_util import go_arch_for_brew_arch, go_suffix_for_arch
 from artcommonlib.assembly import AssemblyTypes
-from artcommonlib.constants import ART_PROD_IMAGE_REPO, KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS, RHCOS_RELEASES_STREAM_URL
-from artcommonlib.konflux.konflux_build_record import KonfluxBuildOutcome, KonfluxBuildRecord
+from artcommonlib.constants import RHCOS_RELEASES_STREAM_URL
+from artcommonlib.konflux.konflux_build_record import KonfluxBuildRecord
 from artcommonlib.konflux.package_rpm_finder import PackageRpmFinder
-from artcommonlib.model import Missing, Model
+from artcommonlib.model import Missing
 from artcommonlib.release_util import isolate_el_version_in_release
-from artcommonlib.util import get_assembly_release_date
+from artcommonlib.util import (
+    get_art_prod_image_repo_for_version,
+    get_assembly_release_date,
+    uses_konflux_imagestream_override,
+)
 from requests.adapters import HTTPAdapter
 from ruamel.yaml import YAML
 from semver import VersionInfo
@@ -68,11 +71,6 @@ def releases_gen_assembly(ctx, name):
     default=False,
     is_flag=True,
     help="If specified, weaker conformance criteria are applied (e.g. a nightly is not required for every arch).",
-)
-@click.option(
-    "--pre-ga-mode",
-    type=click.Choice(["prerelease"], case_sensitive=False),
-    help="Prepare the advisory for 'prerelease' operator release",
 )
 @click.option('--in-flight', 'in_flight', metavar='EDGE', help='An in-flight release that can upgrade to this release')
 @click.option(
@@ -135,7 +133,6 @@ async def gen_assembly_from_releases(
     nightlies: Tuple[str, ...],
     standards: Tuple[str, ...],
     custom: bool,
-    pre_ga_mode: str,
     in_flight: Optional[str],
     previous_list: Tuple[str, ...],
     auto_previous: bool,
@@ -161,7 +158,6 @@ async def gen_assembly_from_releases(
         nightlies=nightlies,
         standards=standards,
         custom=custom,
-        pre_ga_mode=pre_ga_mode,
         in_flight=in_flight,
         previous_list=previous_list,
         auto_previous=auto_previous,
@@ -200,7 +196,6 @@ class GenAssemblyCli:
         nightlies: Tuple[str, ...] = [],
         standards: Tuple[str, ...] = [],
         custom: bool = False,
-        pre_ga_mode: str = '',
         in_flight: Optional[str] = None,
         previous_list: Tuple[str, ...] = None,
         auto_previous: bool = False,
@@ -217,7 +212,6 @@ class GenAssemblyCli:
         self.nightlies = nightlies
         self.standards = standards
         self.custom = custom
-        self.pre_ga_mode = pre_ga_mode
         self.in_flight = in_flight
         self.previous_list = previous_list
         self.auto_previous = auto_previous
@@ -261,10 +255,6 @@ class GenAssemblyCli:
             rpm_meta.get_package_name(): rpm_meta for rpm_meta in self.runtime.rpm_metas()
         }
 
-        # ECs are always prerelease
-        if self.assembly_type == AssemblyTypes.PREVIEW:
-            self.pre_ga_mode = 'prerelease'
-
         # Microshift should always be built and its advisory prepared for preview and candidate assemblies
         # which will eventually go out at GA time
         if self.assembly_type in [AssemblyTypes.PREVIEW, AssemblyTypes.CANDIDATE]:
@@ -306,12 +296,6 @@ class GenAssemblyCli:
             if self.auto_previous or self.previous_list or self.in_flight:
                 self._exit_with_error("Custom releases don't have previous list.")
 
-        if self.pre_ga_mode == "prerelease" and self.assembly_type not in [
-            AssemblyTypes.PREVIEW,
-            AssemblyTypes.CANDIDATE,
-        ]:
-            self._exit_with_error("Prerelease is only valid for preview and candidate assemblies.")
-
         if self.assembly_type is AssemblyTypes.STANDARD and self.includes_release_version is True:
             if "-" not in self.gen_assembly_name:
                 self._exit_with_error(
@@ -324,20 +308,38 @@ class GenAssemblyCli:
             if major_minor != self.runtime.get_minor_version():
                 self._exit_with_error(f'Specified nightly {nightly_name} does not match group major.minor')
             self.reference_releases_by_arch[brew_cpu_arch] = nightly_name
-            rc_suffix = go_suffix_for_arch(brew_cpu_arch, priv)
 
-            if (
-                self.runtime.build_system == 'konflux'
-                and self.runtime.group.removeprefix('openshift-') not in KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS
-            ):
-                release_suffix = f'konflux-release{rc_suffix}'
-            else:
-                release_suffix = f'release{rc_suffix}'
-            nightly_pullspec = f'registry.ci.openshift.org/ocp{rc_suffix}/{release_suffix}:{nightly_name}'
             if brew_cpu_arch in self.release_pullspecs:
                 raise ValueError(
                     f'Cannot process {nightly_name} since {self.release_pullspecs[brew_cpu_arch]} is already included'
                 )
+
+            # Extract major version to determine imagestream naming
+            major_version = int(major_minor.split('.')[0])
+            arch_suffix = go_suffix_for_arch(brew_cpu_arch, priv)
+
+            # Determine version suffix for repo naming
+            # OCP 4.x: no version suffix
+            # OCP 5.x: add version suffix (e.g., '-5')
+            if major_version == 4:
+                version_suffix = ''
+            elif major_version == 5:
+                version_suffix = f'-{major_version}'
+            else:
+                self._exit_with_error(f'Unsupported OCP major version: {major_version}')
+
+            # Determine base repository name based on build system
+            if self.runtime.build_system == 'konflux' and not uses_konflux_imagestream_override(major_minor):
+                base_repo = 'konflux-release'
+            else:
+                base_repo = 'release'
+
+            # Construct repository name: base + version_suffix + arch_suffix
+            # e.g., 'release-5-s390x' for OCP 5.x s390x, 'release' for OCP 4.x amd64
+            repo = f'{base_repo}{version_suffix}{arch_suffix}'
+
+            # Construct the full pullspec
+            nightly_pullspec = f'registry.ci.openshift.org/ocp{arch_suffix}/{repo}:{nightly_name}'
             self.release_pullspecs[brew_cpu_arch] = nightly_pullspec
 
         for standard_release_name in self.standards:
@@ -625,13 +627,15 @@ class GenAssemblyCli:
                                 f"Did not find RHCOS {tag.name} image for architecture: x86_64 in any nightly"
                             )
                         amd64_rhcos_info = util.oc_image_info_for_arch(self.rhcos_by_tag[tag.name]["x86_64"], "amd64")
+                        # NOTE: RHCOS images are currently always in ocp-v4.0-art-dev, even for OCP 5.x.
+                        # When RHCOS 5.x images exist in their own repository, this should be updated to
+                        # use the actual OCP major version: get_art_prod_image_repo_for_version(major, "dev")
+                        art_repo = get_art_prod_image_repo_for_version(4, "dev")
                         rhcos_info = util.oc_image_info_for_arch(
-                            f"{ART_PROD_IMAGE_REPO}:{amd64_rhcos_info['config']['config']['Labels']['coreos.build.manifest-list-tag']}",
+                            f"{art_repo}:{amd64_rhcos_info['config']['config']['Labels']['coreos.build.manifest-list-tag']}",
                             go_arch_for_brew_arch(arch),
                         )
-                        self.rhcos_by_tag[tag.name][arch] = (
-                            f"quay.io/openshift-release-dev/ocp-v4.0-art-dev@{rhcos_info['digest']}"
-                        )
+                        self.rhcos_by_tag[tag.name][arch] = f"{art_repo}@{rhcos_info['digest']}"
                     else:
                         url_key = (
                             f"{major_minor}-{rhcos_el_major}.{rhcos_el_minor}" if rhcos_el_major > 8 else major_minor
@@ -766,7 +770,6 @@ class GenAssemblyCli:
     def _get_advisories_release_jira(self) -> Tuple[Dict[str, int], str]:
         # Add placeholder advisory numbers and JIRA key.
         # Those values will be replaced with real values by pyartcd when preparing a release.
-        preGA_advisory_type = ['prerelease']
 
         if self.runtime.build_system == 'brew':
             advisories = {
@@ -775,16 +778,11 @@ class GenAssemblyCli:
                 'extras': -1,
                 'metadata': -1,
             }
-            for key in preGA_advisory_type:
-                if self.pre_ga_mode == key:
-                    advisories[key] = -1
         else:  # konflux
             advisories = {
                 'rpm': -1,
                 'rhcos': -1,
             }
-            # for konflux, prerelease advisories are noted in the `shipment` field.
-            # No need to add it to the advisories map.
 
         # For OCP >= 4.14, also microshift advisory placeholder must be created
         major, minor = self.runtime.get_major_minor_fields()
@@ -824,14 +822,9 @@ class GenAssemblyCli:
                 return advisories, release_jira
 
         previous_group = self.releases_config.releases[previous_assembly].assembly.group
-        previous_advisories = previous_group.advisories.primitive()
-
-        # preGA advisories (prerelease) associated with an assembly should not be reused
-        # they should be shipped or dropped if not shipping
-        for key in preGA_advisory_type:
-            previous_advisories.pop(key, None)
-
-        advisories.update(previous_advisories)
+        if previous_group.advisories is not Missing:
+            previous_advisories = previous_group.advisories.primitive()
+            advisories.update(previous_advisories)
 
         release_jira = previous_group.release_jira
         self.logger.info(
@@ -860,8 +853,6 @@ class GenAssemblyCli:
 
         if self.assembly_type != AssemblyTypes.CUSTOM:
             group_info['advisories'], group_info["release_jira"] = self._get_advisories_release_jira()
-            if self.pre_ga_mode == 'prerelease':
-                group_info['operator_index_mode'] = 'pre-release'
 
         if self.runtime.build_system == 'konflux':
             group_info['shipment'] = self._get_shipment_info()
@@ -979,8 +970,6 @@ class GenAssemblyCli:
         }
         if env:
             default_shipment['env'] = env
-        if self.pre_ga_mode == 'prerelease':
-            default_shipment['advisories'].append({'kind': 'prerelease'})
         return default_shipment
 
     def _get_previous_shipment_info(self) -> dict:
@@ -1038,10 +1027,6 @@ class GenAssemblyCli:
                 previous_advisories = {ad["kind"]: ad for ad in release.assembly.group.shipment.advisories.primitive()}
                 if previous_advisories:
                     for advisory in advisories:
-                        # preGA advisories (prerelease) associated with an assembly should not be reused
-                        # they should be shipped or dropped if not shipping
-                        if advisory["kind"] == "prerelease":
-                            continue
                         # Reuse advisory if it exists in previous advisories
                         previous_ad = previous_advisories.get(advisory["kind"])
                         if not previous_ad:

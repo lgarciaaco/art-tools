@@ -1,6 +1,5 @@
-import asyncio
 import unittest
-from unittest import IsolatedAsyncioTestCase, mock
+from unittest import IsolatedAsyncioTestCase, TestCase, mock
 from unittest.mock import AsyncMock, MagicMock
 
 from elliottlib import errata as erratalib
@@ -14,11 +13,7 @@ from elliottlib.cli.find_builds_cli import (
 from flexmock import flexmock
 
 
-async def _async_return_val(val):
-    return val
-
-
-class TestFindBuildsCli(unittest.TestCase):
+class TestFindBuildsCli(TestCase):
     """
     Test elliott find-builds command and internal functions
     """
@@ -68,19 +63,24 @@ class TestFindBuildsKonflux(IsolatedAsyncioTestCase):
 
         image_meta_1 = MagicMock(base_only=False, is_release=True, is_payload=True, distgit_key="image1")
         image_meta_1.branch_el_target.return_value = "el8"
+        image_meta_1.get_konflux_network_mode.return_value = "hermetic"
         image_meta_1.get_latest_build = AsyncMock(return_value={"nvr": "image1-1.0.0-1.el8"})
 
         image_meta_2 = MagicMock(base_only=False, is_release=True, is_payload=False, distgit_key="image2")
         image_meta_2.branch_el_target.return_value = "el9"
+        image_meta_2.get_konflux_network_mode.return_value = "open"
         image_meta_2.get_latest_build = AsyncMock(return_value={"nvr": "image2-2.0.0-1.el9"})
 
         runtime.should_receive("image_metas").and_return([image_meta_1, image_meta_2])
         actual_records = await find_builds_konflux(runtime, payload=True)
         self.assertEqual(len(actual_records), 1)
         self.assertEqual(actual_records[0]['nvr'], "image1-1.0.0-1.el8")
+        image_meta_1.get_latest_build.assert_called_once_with(
+            enforce_network_mode=True, el_target="el8", exclude_large_columns=True
+        )
 
 
-class TestFindBuildsKonfluxAllTypes(unittest.IsolatedAsyncioTestCase):
+class TestFindBuildsKonfluxAllTypes(IsolatedAsyncioTestCase):
     @mock.patch("elliottlib.cli.find_builds_cli.KonfluxBuildRecord")
     @mock.patch("elliottlib.cli.find_builds_cli.KonfluxBundleBuildRecord")
     async def test_find_builds_konflux_all_types(self, MockKonfluxBundleBuildRecord, MockKonfluxBuildRecord):
@@ -94,6 +94,7 @@ class TestFindBuildsKonfluxAllTypes(unittest.IsolatedAsyncioTestCase):
             base_only=False, is_release=True, is_payload=True, is_olm_operator=False, distgit_key="image1"
         )
         image_meta_1.branch_el_target.return_value = "el8"
+        image_meta_1.get_konflux_network_mode.return_value = "hermetic"
         build_1 = MagicMock(nvr="image1-1.0.0-1.el8")
         image_meta_1.get_latest_build = AsyncMock(return_value=build_1)
 
@@ -101,6 +102,7 @@ class TestFindBuildsKonfluxAllTypes(unittest.IsolatedAsyncioTestCase):
             base_only=False, is_release=True, is_payload=False, is_olm_operator=True, distgit_key="image2"
         )
         image_meta_2.branch_el_target.return_value = "el9"
+        image_meta_2.get_konflux_network_mode.return_value = "open"
         build_2 = MagicMock(nvr="image2-2.0.0-1.el9")
         image_meta_2.get_latest_build = AsyncMock(return_value=build_2)
 
@@ -127,6 +129,12 @@ class TestFindBuildsKonfluxAllTypes(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(builds_map['olm_builds']), 1)
         self.assertEqual(builds_map['olm_builds'][0], build_3.nvr)
         self.assertEqual(len(builds_map['olm_builds_not_found']), 0)
+        image_meta_1.get_latest_build.assert_called_once_with(
+            enforce_network_mode=True, el_target="el8", exclude_large_columns=True
+        )
+        image_meta_2.get_latest_build.assert_called_once_with(
+            enforce_network_mode=True, el_target="el9", exclude_large_columns=True
+        )
 
 
 if __name__ == "__main__":

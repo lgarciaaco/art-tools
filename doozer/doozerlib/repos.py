@@ -4,7 +4,6 @@ import json
 import os
 import threading
 import time
-from string import Template
 from typing import Dict, List, Optional, Union, cast
 
 import requests
@@ -64,24 +63,20 @@ class Repo(object):
                 plashet_arches = set(plashet_arches)
                 arches = [arch for arch in arches if arch in plashet_arches]
 
-            vars_dict = {}
-            if template_vars:
-                vars_dict.update(template_vars)
-
             # Build conf dict with baseurl for each architecture
             conf = repo_config.conf.copy() if repo_config.conf else {}
 
             # If baseurl is not provided in repo config, construct it from plashet config
             if 'baseurl' not in conf or not conf['baseurl']:
-                vars_dict['slug'] = repo_config.plashet.slug or repo_config.name
                 baseurl_dict = {}
 
                 for arch in arches:
-                    vars_dict['arch'] = arch
-
-                    # Use string.Template to substitute variables in download_url
-                    template = Template(plashet_config.download_url)
-                    baseurl_dict[arch] = template.substitute(vars_dict)
+                    # Use the new construct_download_url method
+                    baseurl_dict[arch] = repo_config.construct_download_url(
+                        arch=arch,
+                        plashet_config=plashet_config,
+                        replace_vars=template_vars,
+                    )
 
                 conf['baseurl'] = baseurl_dict
             repo_dict['conf'] = conf
@@ -206,6 +201,10 @@ class Repo(object):
     def __repr__(self):
         """For debugging mainly, to display contents as a dict"""
         return str(self._data)
+
+    def to_dict(self) -> Dict:
+        """Export repo configuration as a dictionary."""
+        return self._data.primitive()
 
     def baseurl(self, repotype, arch):
         if not repotype:

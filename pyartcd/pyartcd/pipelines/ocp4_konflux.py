@@ -11,8 +11,14 @@ import click
 import yaml
 from artcommonlib import exectools, redis
 from artcommonlib.build_visibility import is_release_embargoed
-from artcommonlib.constants import KONFLUX_ART_IMAGES_SHARE, KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS
-from artcommonlib.util import new_roundtrip_yaml_handler, run_safe, sync_to_quay, validate_build_priority
+from artcommonlib.constants import KONFLUX_ART_IMAGES_SHARE
+from artcommonlib.util import (
+    new_roundtrip_yaml_handler,
+    run_safe,
+    sync_to_quay,
+    uses_konflux_imagestream_override,
+    validate_build_priority,
+)
 
 from pyartcd import constants, jenkins, locks, oc, util
 from pyartcd import record as record_util
@@ -63,7 +69,7 @@ class EnumEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
-class KonfluxOcp4Pipeline:
+class KonfluxOcpPipeline:
     def __init__(
         self,
         runtime: Runtime = None,
@@ -329,8 +335,10 @@ class KonfluxOcp4Pipeline:
             LOGGER.error('record.log not found!')
             return
 
-        built_images = [entry['name'] for entry in record_log['image_build_konflux'] if not int(entry['status'])]
-        failed_images = [entry['name'] for entry in record_log['image_build_konflux'] if int(entry['status'])]
+        built_images = [
+            entry['name'] for entry in record_log.get('image_build_konflux', []) if not int(entry['status'])
+        ]
+        failed_images = [entry['name'] for entry in record_log.get('image_build_konflux', []) if int(entry['status'])]
         if 1 <= len(failed_images) <= 10:
             jenkins.update_description(f'Failed images: {", ".join(failed_images)}<br/>')
         elif len(failed_images) > 10:
@@ -366,7 +374,7 @@ class KonfluxOcp4Pipeline:
             doozer_data_gitref=self.data_gitref,
             build_system='konflux',
             exclude_arches=exclude_arches,
-            SKIP_MULTI_ARCH_PAYLOAD=False,
+            SKIP_MULTI_ARCH_PAYLOAD="auto",
         )
 
     async def mirror_streams_to_ci(self):
@@ -460,6 +468,7 @@ class KonfluxOcp4Pipeline:
             group=f'openshift-{self.version}',
             assembly=self.assembly,
             build_system='konflux',
+            working_dir=Path(self.runtime.doozer_working),
             doozer_data_path=self.data_path,
             doozer_data_gitref=self.data_gitref,
         )
@@ -469,6 +478,7 @@ class KonfluxOcp4Pipeline:
         group_rpms = await get_group_rpms(
             group=f'openshift-{self.version}',
             assembly=self.assembly,
+            working_dir=Path(self.runtime.doozer_working),
             doozer_data_path=self.data_path,
             doozer_data_gitref=self.data_gitref,
         )
@@ -534,7 +544,7 @@ class KonfluxOcp4Pipeline:
     def check_building_rpms(self):
         # If the version is not in the override list, skip the RPM rebase and build
         # TODO this can be removed once all versions are handled by ocp4-konflux
-        if self.version not in KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS:
+        if not uses_konflux_imagestream_override(self.version):
             self.runtime.logger.info(
                 'Skipping RPM rebase and build for %s since it is being handled by ocp4', {self.version}
             )
@@ -681,7 +691,7 @@ class KonfluxOcp4Pipeline:
             return
 
         # Get the list of successful builds
-        builds_to_mirror = [entry for entry in record_log['image_build_konflux'] if not int(entry['status'])]
+        builds_to_mirror = [entry for entry in record_log.get('image_build_konflux', []) if not int(entry['status'])]
 
         async def sync_build(build):
             release = build["nvrs"].split("-")[-1]
@@ -708,7 +718,7 @@ class KonfluxOcp4Pipeline:
         await self.rebase_and_build_rpms(self.release)
 
         # Build plashets if needed
-        if not self.skip_plashets and self.version in KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS:
+        if not self.skip_plashets and uses_konflux_imagestream_override(self.version):
             group_param = f"openshift-{self.version}"
             jenkins.start_build_plashets(
                 group=group_param,
@@ -732,7 +742,7 @@ class KonfluxOcp4Pipeline:
 
             await self.sync_images()
 
-            if self.version in KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS:
+            if uses_konflux_imagestream_override(self.version):
                 await self.sweep_bugs()
                 await self.sweep_golang_bugs()
             else:
@@ -905,7 +915,7 @@ async def ocp4(
     if not lock_identifier:
         runtime.logger.warning('Env var BUILD_URL has not been defined: a random identifier will be used for the locks')
 
-    pipeline = KonfluxOcp4Pipeline(
+    pipeline = KonfluxOcpPipeline(
         runtime=runtime,
         assembly=assembly,
         data_path=data_path,

@@ -27,10 +27,11 @@ jenkins_client: Optional[Jenkins] = None
 class Jobs(Enum):
     BUILD_SYNC = 'aos-cd-builds/build%2Fbuild-sync'
     BUILD_SYNC_KONFLUX = 'aos-cd-builds/build%2Fbuild-sync-konflux'
+    BUILD_SYNC_MULTI = 'aos-cd-builds/build%2Fbuild-sync-multi'
     BUILD_MICROSHIFT = 'aos-cd-builds/build%2Fbuild-microshift'
     BUILD_MICROSHIFT_BOOTC = 'aos-cd-builds/build%2Fbuild-microshift-bootc'
     OCP4 = 'aos-cd-builds/build%2Focp4'
-    OKD4 = 'aos-cd-builds/build%2Fokd4'
+    OKD = 'aos-cd-builds/build%2Fokd'
     OCP4_KONFLUX = 'aos-cd-builds/build%2Focp4-konflux'
     OCP4_SCAN = 'aos-cd-builds/build%2Focp4_scan'
     OCP4_SCAN_KONFLUX = 'aos-cd-builds/build%2Focp4-scan-konflux'
@@ -45,6 +46,7 @@ class Jobs(Enum):
     BUILD_FBC = 'aos-cd-builds/build%2Fbuild-fbc'
     OADP = 'aos-cd-builds/build%2Foadp'
     OADP_SCAN = 'aos-cd-builds/build%2Foadp-scan'
+    SCAN_PLASHET_RPMS = 'scanning/scanning%2Fplashet-rpms'
 
 
 def get_jenkins_url():
@@ -371,7 +373,7 @@ def start_ocp4(
     )
 
 
-def start_okd4(
+def start_okd(
     build_version: str,
     assembly: str,
     image_list: list,
@@ -387,7 +389,7 @@ def start_okd4(
     }
 
     return start_build(
-        job=Jobs.OKD4,
+        job=Jobs.OKD,
         params=params,
         **kwargs,
     )
@@ -454,6 +456,18 @@ def start_ocp4_scan_konflux(version: str, **kwargs) -> Optional[str]:
     )
 
 
+def start_scan_plashet_rpms(group: str, assembly: str = 'stream', **kwargs) -> Optional[str]:
+    params = {
+        'GROUP': group,
+        'ASSEMBLY': assembly,
+    }
+    return start_build(
+        job=Jobs.SCAN_PLASHET_RPMS,
+        params=params,
+        **kwargs,
+    )
+
+
 def start_rhcos(build_version: str, new_build: bool, job_name: str = 'build', **kwargs) -> Optional[str]:
     return start_build(
         job=Jobs.RHCOS,
@@ -492,6 +506,35 @@ def start_build_sync(
             job=Jobs.BUILD_SYNC_KONFLUX,
             params=params | kwargs,
         )
+
+
+def start_build_sync_multi(
+    version: str,
+    multi_model: Optional[str] = None,
+    assembly: str = 'stream',
+    doozer_data_path: Optional[str] = None,
+    doozer_data_gitref: Optional[str] = None,
+    exclude_arches: list = None,
+    **kwargs,
+) -> Optional[str]:
+    params = {
+        'BUILD_VERSION': version,
+        'ASSEMBLY': assembly,
+    }
+    if multi_model:
+        params['MULTI_MODEL'] = multi_model
+    if doozer_data_path:
+        params['DOOZER_DATA_PATH'] = doozer_data_path
+    if doozer_data_gitref:
+        params['DOOZER_DATA_GITREF'] = doozer_data_gitref
+    if exclude_arches:
+        params['EXCLUDE_ARCHES'] = ','.join(exclude_arches)
+
+    return start_build(
+        job=Jobs.BUILD_SYNC_MULTI,
+        params=params,
+        **kwargs,
+    )
 
 
 def start_cincinnati_prs(

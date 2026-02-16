@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import pprint
+import re
 import traceback
 import uuid
 from dataclasses import dataclass
@@ -15,7 +16,6 @@ from artcommonlib import constants as artlib_constants
 from artcommonlib import util as artlib_util
 from artcommonlib.arch_util import go_arch_for_brew_arch
 from artcommonlib.build_visibility import is_release_embargoed
-from artcommonlib.exectools import limit_concurrency
 from artcommonlib.konflux.konflux_build_record import ArtifactType, Engine, KonfluxBuildOutcome, KonfluxBuildRecord
 from artcommonlib.model import Missing
 from artcommonlib.release_util import SoftwareLifecyclePhase, isolate_el_version_in_release, split_el_suffix_in_release
@@ -25,13 +25,12 @@ from dockerfile_parse import DockerfileParser
 from doozerlib import constants, util
 from doozerlib.backend.build_repo import BuildRepo
 from doozerlib.backend.konflux_client import KonfluxClient
-from doozerlib.backend.pipelinerun_utils import ContainerInfo, PipelineRunInfo
+from doozerlib.backend.pipelinerun_utils import PipelineRunInfo
 from doozerlib.backend.rebaser import KonfluxRebaser
 from doozerlib.image import ImageMetadata
 from doozerlib.lockfile import DEFAULT_ARTIFACT_LOCKFILE_NAME, DEFAULT_RPM_LOCKFILE_NAME
 from doozerlib.record_logger import RecordLogger
 from doozerlib.source_resolver import SourceResolution
-from kubernetes.dynamic import resource
 from packageurl import PackageURL
 from tenacity import retry, stop_after_attempt, wait_fixed
 
@@ -242,7 +241,9 @@ class KonfluxImageBuilder:
 
                 if self._config.dry_run:
                     logger.info("Dry run: Would have inserted build record in Konflux DB")
-                else:
+
+                elif outcome is KonfluxBuildOutcome.SUCCESS or attempt == (retries - 1):
+                    # Only create a failed build record if this is the latest attempt
                     await self.update_konflux_db(
                         metadata, build_repo, pipelinerun_info, outcome, building_arches, build_priority
                     )
@@ -258,9 +259,11 @@ class KonfluxImageBuilder:
                     record["message"] = "Success"
                     record["status"] = 0
                     break
+
             if not metadata.build_status and error:
                 record["message"] = str(error)
                 raise error
+
         finally:
             if self._record_logger:
                 if 'okd' in self._config.group_name:
@@ -404,10 +407,19 @@ class KonfluxImageBuilder:
                 "path": lockfile_path,
             }
 
-            if group.startswith("openshift-"):
+            golang_pattern = re.compile(r'^golang-|^rhel-\d+-golang-\d+\.\d+')
+            if group.startswith("openshift-") or golang_pattern.match(group):
                 # For groups like oadp, mta, logging we should always use signed repos
-                phase = SoftwareLifecyclePhase.from_name(metadata.runtime.group_config.software_lifecycle.phase)
-                if phase <= SoftwareLifecyclePhase.SIGNING:
+                # For golang groups (golang-* and rhel-X-golang-Y.Z), always exclude gpg check regardless of lifecycle phase
+                should_disable_gpg = False
+
+                if golang_pattern.match(group):
+                    should_disable_gpg = True
+                elif group.startswith("openshift-"):
+                    phase = SoftwareLifecyclePhase.from_name(metadata.runtime.group_config.software_lifecycle.phase)
+                    should_disable_gpg = phase <= SoftwareLifecyclePhase.SIGNING
+
+                if should_disable_gpg:
                     enabled_repos = metadata.get_enabled_repos()
                     if enabled_repos:
                         dnf_options = {}
@@ -449,7 +461,7 @@ class KonfluxImageBuilder:
                 f"Skipping generic prefetch - network_mode: {network_mode}, artifact_lockfile_enabled: {artifact_lockfile_enabled}"
             )
 
-        for package_manager in ["gomod", "npm", "pip", "yarn"]:
+        for package_manager in ["gomod", "npm", "pip", "yarn", "cargo"]:
             if package_manager in required_package_managers:
                 paths: dict = metadata.config.cachito.packages.get(package_manager, [])
 
@@ -723,7 +735,9 @@ class KonfluxImageBuilder:
             'artifact_type': ArtifactType.IMAGE,
             'engine': Engine.KONFLUX,
             'outcome': outcome,
-            'parent_images': df.parent_images,
+            'parent_images': await self.extract_parent_image_nvrs(
+                df.parent_images, logger, self._config.registry_auth_file
+            ),
             'art_job_url': os.getenv('BUILD_URL', 'n/a'),
             'build_id': f'{pipelinerun_name}-{pipelinerun_uid}',
             'build_pipeline_url': build_pipeline_url,
@@ -908,3 +922,66 @@ class KonfluxImageBuilder:
             rows.append(taskrun_record)
 
         return rows
+
+    @staticmethod
+    async def extract_parent_image_nvrs(
+        parent_image_pullspecs: List[str],
+        logger: logging.Logger,
+        registry_auth_file: Optional[str] = None,
+    ) -> List[str]:
+        """
+        Extract NVRs from parent image pullspecs by inspecting their labels.
+
+        For each parent image, attempts to extract the NVR from container labels
+        (com.redhat.component, version, release). If the image doesn't have these
+        labels (e.g., external images not built by the tool), returns the original
+        pullspec for that entry.
+
+        NVRs never contain '/', so code reading this field can distinguish between
+        NVRs and pullspecs by checking for the presence of '/'.
+
+        :param parent_image_pullspecs: List of parent image pullspecs from the Dockerfile
+        :param logger: Logger instance for debug output
+        :param registry_auth_file: Optional path to registry auth file for pulling image metadata
+        :return: List of NVRs (or original pullspecs for unknown) corresponding to each parent image
+        """
+        parent_image_nvrs = []
+        for pullspec in parent_image_pullspecs:
+            try:
+                # Use oc image info with optional auth file to get image labels
+                # Use --filter-by-os to handle manifest list images
+                auth_arg = f"-a {registry_auth_file}" if registry_auth_file else ""
+                cmd = f"oc image info -o json --filter-by-os=amd64 {auth_arg} {pullspec}"
+                rc, stdout, stderr = await exectools.cmd_gather_async(cmd, check=False)
+
+                if rc != 0:
+                    # Could not access the image - this is unexpected and worth a warning
+                    logger.warning(f"Could not access parent image {pullspec}: {stderr}")
+                    parent_image_nvrs.append(pullspec)
+                    continue
+
+                image_info = json.loads(stdout)
+                labels = image_info.get('config', {}).get('config', {}).get('Labels', {})
+
+                name = labels.get('com.redhat.component')
+                version = labels.get('version')
+                release = labels.get('release')
+
+                if name and version and release:
+                    nvr = f"{name}-{version}-{release}"
+                    parent_image_nvrs.append(nvr)
+                    logger.debug(f"Extracted NVR {nvr} from parent image {pullspec}")
+                else:
+                    # Image accessible but missing NVR labels (external image) - informational
+                    logger.info(
+                        f"Parent image {pullspec} missing NVR labels: "
+                        f"component={name}, version={version}, release={release}"
+                    )
+                    parent_image_nvrs.append(pullspec)
+
+            except Exception as e:
+                # Unexpected error during processing
+                logger.warning(f"Error extracting NVR from parent image {pullspec}: {e}")
+                parent_image_nvrs.append(pullspec)
+
+        return parent_image_nvrs

@@ -18,32 +18,31 @@ import openshift_client as oc
 import yaml
 from artcommonlib import exectools, rhcos
 from artcommonlib.arch_util import brew_arch_for_go_arch, go_arch_for_brew_arch, go_suffix_for_arch
-from artcommonlib.assembly import AssemblyIssue, AssemblyIssueCode, AssemblyTypes, assembly_basis
+from artcommonlib.assembly import AssemblyIssue, AssemblyIssueCode, AssemblyTypes, assembly_basis, assembly_basis_event
 from artcommonlib.constants import (
     COREOS_RHEL10_STREAMS,
-    KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS,
-    RHCOS_RELEASES_STREAM_URL,
 )
 from artcommonlib.exectools import manifest_tool
 from artcommonlib.format_util import red_print
-from artcommonlib.konflux.konflux_build_record import KonfluxBuildRecord
 from artcommonlib.konflux.package_rpm_finder import PackageRpmFinder
 from artcommonlib.model import Model
 from artcommonlib.rhcos import RhcosMissingContainerException
 from artcommonlib.rpm_utils import parse_nvr
 from artcommonlib.telemetry import start_as_current_span_async
-from artcommonlib.util import convert_remote_git_to_https
+from artcommonlib.util import (
+    convert_remote_git_to_https,
+    get_art_prod_image_repo_for_version,
+    uses_konflux_imagestream_override,
+)
 from elliottlib.util import chunk
 from opentelemetry import trace
 from tenacity import retry, stop_after_attempt, wait_fixed
 
-from doozerlib import release_inspector
 from doozerlib.assembly_inspector import AssemblyInspector
 from doozerlib.brew import KojiWrapperMetaReturn
 from doozerlib.build_info import (
     BuildRecordInspector,
     ImageInspector,
-    KonfluxBuildRecordInspector,
 )
 from doozerlib.cli import cli, click_coroutine, pass_runtime
 from doozerlib.cli.release_gen_assembly import GenAssemblyCli
@@ -115,15 +114,15 @@ class RepositoryType(Enum):
     "--repository",
     metavar="REPO",
     required=False,
-    default="ocp-v4.0-art-dev",
-    help="Quay REPOSITORY in ORGANIZATION to mirror into.\ndefault=ocp-v4.0-art-dev",
+    default=None,
+    help="Quay REPOSITORY in ORGANIZATION to mirror into. If not specified, computed from OCP version (e.g., ocp-v5.0-art-dev for OCP 5.x)",
 )
 @click.option(
     "--private-repository",
     metavar="REPO",
     required=False,
-    default="ocp-v4.0-art-dev-priv",
-    help="Private Quay REPOSITORY in ORGANIZATION to mirror into.\ndefault=ocp-v4.0-art-dev-priv",
+    default=None,
+    help="Private Quay REPOSITORY in ORGANIZATION to mirror into. If not specified, computed from OCP version (e.g., ocp-v5.0-art-dev-priv for OCP 5.x)",
 )
 @click.option(
     "--release-repository",
@@ -268,6 +267,17 @@ read and propagate/expose this annotation in its display of the release image.
     else:
         runtime.initialize(mode="both", clone_distgits=False, clone_source=False, prevent_cloning=True)
 
+    # Compute repository names if not specified
+    if repository is None:
+        major_version = int(runtime.group_config.vars['MAJOR'])
+        repository = get_art_prod_image_repo_for_version(major_version, "dev").split("/")[-1]
+        runtime.logger.info(f"Repository not specified, using computed value: {repository}")
+
+    if private_repository is None:
+        major_version = int(runtime.group_config.vars['MAJOR'])
+        private_repository = get_art_prod_image_repo_for_version(major_version, "dev-priv").split("/")[-1]
+        runtime.logger.info(f"Private repository not specified, using computed value: {private_repository}")
+
     await GenPayloadCli(
         runtime,
         is_name or assembly_imagestream_base_name(runtime),
@@ -293,7 +303,7 @@ def default_imagestream_base_name(version: str, runtime: Runtime) -> str:
 
 
 def default_imagestream_base_name_generic(version: str, build_system) -> str:
-    if version in KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS or build_system == 'brew':
+    if uses_konflux_imagestream_override(version) or build_system == 'brew':
         return f"{version}-art-latest"
     else:  # konflux
         return f"{version}-konflux-art-latest"
@@ -309,7 +319,7 @@ def assembly_imagestream_base_name(runtime: Runtime) -> str:
 def assembly_imagestream_base_name_generic(version, assembly_name, assembly_type, build_system):
     if assembly_name == 'stream' and assembly_type is AssemblyTypes.STREAM:
         return default_imagestream_base_name_generic(version, build_system)
-    elif version in KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS or build_system == 'brew':
+    elif uses_konflux_imagestream_override(version) or build_system == 'brew':
         return f"{version}-art-assembly-{assembly_name}"
     else:  # konflux
         return f"{version}-konflux-art-assembly-{assembly_name}"
@@ -592,7 +602,6 @@ class GenPayloadCli:
             nightlies=(multi_model_nightly,),  # Single nightly to model from
             standards=(),
             custom=False,  # Not a custom assembly
-            pre_ga_mode='',
             in_flight=None,
             previous_list=(),
             auto_previous=False,
@@ -641,6 +650,14 @@ class GenPayloadCli:
         rt.assembly = multi_model_assembly_name
         # Keep assembly_type as STREAM to avoid SemVer parsing issues
         rt.assembly_type = AssemblyTypes.STREAM
+
+        # CRITICAL: Recalculate assembly_basis_event after changing the assembly
+        # Without this, get_latest_build() won't filter to the basis time and will
+        # return the absolute latest Konflux builds instead of the builds from the nightly
+        rt.assembly_basis_event = assembly_basis_event(
+            rt.get_releases_config(), rt.assembly, strict=False, build_system=rt.build_system
+        )
+        self.logger.info(f"Recalculated assembly_basis_event: {rt.assembly_basis_event}")
 
         self.logger.info(f"Applied multi-model assembly '{multi_model_assembly_name}' to runtime (as STREAM type)")
 
@@ -696,65 +713,30 @@ class GenPayloadCli:
         """
         minor_version = self.runtime.get_minor_version()
         stream_name = f"{minor_version}.0-0.nightly"
+        tags_url = f"https://{arch}.ocp.releases.ci.openshift.org/api/v1/releasestream/{stream_name}/tags"
 
         try:
             async with aiohttp.ClientSession() as session:
-                if offset == 0:
-                    # For offset 0, we can use the latest release endpoint directly
-                    release_controller_url = (
-                        f"https://{arch}.ocp.releases.ci.openshift.org/api/v1/releasestream/{stream_name}/latest"
+                self.logger.info(f"Querying release stream tags: {tags_url}")
+
+                async with session.get(tags_url) as resp:
+                    if resp.status != 200:
+                        raise DoozerFatalError(f"Failed to query release stream tags at {tags_url}: HTTP {resp.status}")
+                    stream_data = await resp.json()
+
+                # Get the tags list (releases are called "tags" in this API)
+                releases = stream_data.get('tags', [])
+                if not releases:
+                    raise DoozerFatalError(f"No releases found in stream '{stream_name}' for {arch}")
+
+                if offset >= len(releases):
+                    raise DoozerFatalError(
+                        f"Offset {offset} is out of range. Stream '{stream_name}' only has {len(releases)} releases."
                     )
-                    self.logger.info(f"Querying release controller for {arch} latest nightly: {release_controller_url}")
 
-                    async with session.get(release_controller_url) as resp:
-                        if resp.status != 200:
-                            raise DoozerFatalError(
-                                f"Failed to query release controller at {release_controller_url}: HTTP {resp.status}"
-                            )
-                        release_data = await resp.json()
-
-                    if 'name' not in release_data:
-                        raise DoozerFatalError(f"No 'name' field in release controller response for {arch}")
-                    nightly_name = release_data['name']
-                    self.logger.info(f"Resolved {arch}:{offset} to latest nightly: {nightly_name}")
-                    return nightly_name
-                else:
-                    # For other offsets, we need to query the full stream list
-                    streams_url = f"https://{arch}.ocp.releases.ci.openshift.org/api/v1/releasestreams/all"
-                    self.logger.info(f"Querying release streams for offset {offset}: {streams_url}")
-
-                    async with session.get(streams_url) as resp:
-                        if resp.status != 200:
-                            raise DoozerFatalError(
-                                f"Failed to query release streams at {streams_url}: HTTP {resp.status}"
-                            )
-                        streams_data = await resp.json()
-
-                    # Find the matching stream
-                    matching_stream = None
-                    for stream in streams_data:
-                        if stream.get('name') == stream_name:
-                            matching_stream = stream
-                            break
-
-                    if not matching_stream:
-                        raise DoozerFatalError(
-                            f"Could not find stream '{stream_name}' in release controller for {arch}"
-                        )
-
-                    # Get the releases list
-                    releases = matching_stream.get('releases', [])
-                    if not releases:
-                        raise DoozerFatalError(f"No releases found in stream '{stream_name}' for {arch}")
-
-                    if offset >= len(releases):
-                        raise DoozerFatalError(
-                            f"Offset {offset} is out of range. Stream '{stream_name}' only has {len(releases)} releases."
-                        )
-
-                    nightly_name = releases[offset]['name']
-                    self.logger.info(f"Resolved {arch}:{offset} to nightly: {nightly_name}")
-                    return nightly_name
+                nightly_name = releases[offset]['name']
+                self.logger.info(f"Resolved {arch}:{offset} to nightly: {nightly_name}")
+                return nightly_name
 
         except aiohttp.ClientError as e:
             raise DoozerFatalError(f"HTTP client error querying release controller for {arch}:{offset}: {e}")
@@ -2699,7 +2681,7 @@ class PayloadGenerator:
             return terminal_issue(f"Specified nightly {nightly} does not match group major.minor")
 
         # For 4.20, remove the -konflux suffix as Konflux builds are being mirrored to standard imagestreams
-        if runtime.build_system == 'brew' or major_minor in KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS:
+        if runtime.build_system == 'brew' or uses_konflux_imagestream_override(major_minor):
             release_suffix = 'release'
         else:
             release_suffix = 'konflux-release'

@@ -10,32 +10,32 @@ import tempfile
 import time
 import traceback
 from datetime import datetime, timezone
-from importlib import util
+from functools import cached_property
 from io import StringIO
 from pathlib import Path
 from typing import Optional, cast
 from urllib.parse import urlparse
 
 import click
-import gitlab
 import requests
 from artcommonlib import exectools
 from artcommonlib.arch_util import brew_arch_for_go_arch
 from artcommonlib.assembly import AssemblyTypes
-from artcommonlib.config.repo import BrewSource, BrewTag, PlashetRepo, Repo, RepoList
+from artcommonlib.config.repo import RepoList
 from artcommonlib.constants import SHIPMENT_DATA_URL_TEMPLATE
+from artcommonlib.gitlab import GitLabClient
 from artcommonlib.konflux.konflux_build_record import ArtifactType, Engine, KonfluxBuildOutcome, KonfluxBuildRecord
 from artcommonlib.konflux.konflux_db import KonfluxDb
 from artcommonlib.model import Model
 from artcommonlib.util import (
-    convert_remote_git_to_ssh,
+    get_art_prod_image_repo_for_version,
     get_ocp_version_from_group,
     new_roundtrip_yaml_handler,
     sync_to_quay,
 )
 from doozerlib.backend.konflux_client import API_VERSION, KIND_SNAPSHOT
 from doozerlib.backend.konflux_image_builder import KonfluxImageBuilder
-from doozerlib.constants import ART_PROD_IMAGE_REPO, ART_PROD_PRIV_IMAGE_REPO, KONFLUX_DEFAULT_IMAGE_REPO
+from doozerlib.constants import KONFLUX_DEFAULT_IMAGE_REPO
 from elliottlib.shipment_model import ShipmentConfig, Snapshot, SnapshotSpec
 from github import Github, GithubException
 
@@ -82,6 +82,9 @@ class BuildMicroShiftBootcPipeline:
         self.slack_client = slack_client
         self._logger = logger or runtime.logger
 
+        # Track existing shipment timestamp to avoid creating new files on MR updates
+        self.existing_shipment_timestamp = None
+
         # Check if GitHub token is available (unless in dry-run mode)
         if not runtime.dry_run:
             github_token = os.environ.get("GITHUB_TOKEN")
@@ -115,6 +118,7 @@ class BuildMicroShiftBootcPipeline:
         # Initialize GitRepository for shipment data (will be setup later if needed)
         self.shipment_data_repo = None
         self.gitlab_token = None
+        self.shipment_mr_url = None
 
         # sets environment variables for Elliott and Doozer
         self._elliott_env_vars = os.environ.copy()
@@ -191,23 +195,26 @@ class BuildMicroShiftBootcPipeline:
         self._logger.info("Bootc image digests by arch: %s", json.dumps(digest_by_arch, indent=4))
 
         if not self.runtime.dry_run:
+            major, _ = self._ocp_version
             if bootc_build.embargoed:
-                await sync_to_quay(bootc_build.image_pullspec, ART_PROD_PRIV_IMAGE_REPO)
+                art_repo = get_art_prod_image_repo_for_version(major, "dev-priv")
+                await sync_to_quay(bootc_build.image_pullspec, art_repo)
             else:
-                await sync_to_quay(bootc_build.image_pullspec, ART_PROD_IMAGE_REPO)
+                art_repo = get_art_prod_image_repo_for_version(major, "dev")
+                await sync_to_quay(bootc_build.image_pullspec, art_repo)
                 # sync per-arch bootc-pullspec.txt to mirror
                 if self.assembly_type in [AssemblyTypes.PREVIEW, AssemblyTypes.CANDIDATE]:
                     self._logger.info(f"Found assembly type {self.assembly_type}. Syncing bootc build to mirror")
                     await asyncio.gather(
                         *(
-                            self.sync_to_mirror(arch, bootc_build.el_target, f"{ART_PROD_IMAGE_REPO}@{digest}")
+                            self.sync_to_mirror(arch, bootc_build.el_target, f"{art_repo}@{digest}")
                             for arch, digest in digest_by_arch.items()
                         ),
                     )
         else:
-            self._logger.warning(
-                "Skipping sync to quay.io/openshift-release-dev/ocp-v4.0-art-dev since in dry-run mode"
-            )
+            major, _ = self._ocp_version
+            art_repo = get_art_prod_image_repo_for_version(major, "dev")
+            self._logger.warning(f"Skipping sync to {art_repo} since in dry-run mode")
 
         # Pin the image to the assembly if not STREAM
         if self.assembly_type != AssemblyTypes.STREAM:
@@ -219,6 +226,10 @@ class BuildMicroShiftBootcPipeline:
 
             if self.prepare_shipment:
                 await self._prepare_shipment(bootc_build)
+
+            if self.shipment_mr_url and not self.runtime.dry_run:
+                await self._set_shipment_mr_ready()
+                await self.slack_client.say_in_thread("Completed preparing microshift-bootc shipment.")
 
     async def sync_to_mirror(self, arch, el_target, pullspec):
         arch = brew_arch_for_go_arch(arch)
@@ -390,7 +401,7 @@ class BuildMicroShiftBootcPipeline:
         bootc_image_name = "microshift-bootc"
         major, minor = self._ocp_version
         # do not run for version < 4.18
-        if major < 4 or (major == 4 and minor < 18):
+        if (major, minor) < (4, 18):
             self._logger.info("Skipping bootc image build for version < 4.18")
             return
 
@@ -674,10 +685,38 @@ class BuildMicroShiftBootcPipeline:
         shipment_config.shipment.snapshot = snapshot
 
         # Step 6: Create shipment MR
-        shipment_mr_url = await self._create_shipment_mr(shipment_config)
+        self.shipment_mr_url = await self._create_shipment_mr(shipment_config)
 
-        await self.slack_client.say_in_thread(f"Shipment MR created: {shipment_mr_url}")
-        await self.slack_client.say_in_thread("Completed preparing microshift-bootc shipment.")
+        if self.shipment_mr_url:
+            await self.slack_client.say_in_thread(f"Shipment MR created: {self.shipment_mr_url}")
+        else:
+            await self.slack_client.say_in_thread("No changes in shipment data. MR was not created or updated.")
+
+    async def _set_shipment_mr_ready(self):
+        """
+        Mark the shipment MR as ready by removing the Draft prefix from the title.
+        This should be called at the end of the pipeline when all work is complete.
+        """
+        mr = await self._gitlab.set_mr_ready(self.shipment_mr_url)
+
+        if mr and not self.runtime.dry_run:
+            await self.slack_client.say_in_thread(f"Shipment MR marked as ready: {self.shipment_mr_url}")
+
+            # Trigger CI pipeline after marking as ready
+            # wait for 30 seconds to ensure the MR is updated
+            self._logger.info("Waiting for 30 seconds to ensure MR is updated...")
+            await asyncio.sleep(30)
+
+            try:
+                pipeline_url = await self._gitlab.trigger_ci_pipeline(mr)
+                if pipeline_url:
+                    await self.slack_client.say_in_thread(f"CI pipeline triggered: {pipeline_url}")
+                else:
+                    await self.slack_client.say_in_thread(
+                        f"Failed to trigger CI pipeline for MR branch {mr.source_branch}"
+                    )
+            except Exception as e:
+                self._logger.warning(f"Failed to trigger CI MR pipeline for branch {mr.source_branch}: {e}")
 
     async def _setup_shipment_environment(self):
         """Setup environment variables and tokens required for shipment operations"""
@@ -737,6 +776,11 @@ class BuildMicroShiftBootcPipeline:
             # Use the most recent file (by filename, which includes timestamp)
             latest_file = max(matching_files)
             self._logger.info("Loading existing shipment config from: %s", latest_file)
+
+            # Extract timestamp from filename: {assembly}.microshift-bootc.{timestamp}.yaml
+            filename = Path(latest_file).name
+            timestamp_part = filename.replace(f"{self.assembly}.microshift-bootc.", "").replace(".yaml", "")
+            self.existing_shipment_timestamp = timestamp_part
 
             with open(latest_file, 'r') as f:
                 shipment_data = yaml.load(f.read())
@@ -821,14 +865,15 @@ class BuildMicroShiftBootcPipeline:
 
         self._logger.info("Shipment data repository setup completed")
 
-    async def _create_shipment_mr(self, shipment_config: ShipmentConfig) -> str:
-        """Create or update shipment MR with the given shipment config"""
+    async def _create_shipment_mr(self, shipment_config: ShipmentConfig) -> str | None:
+        """Create or update shipment MR with the given shipment config. Returns None if no changes."""
         self._logger.info("Creating or updating shipment MR...")
 
         # Branch handling is now done in _load_or_init_shipment_config
         source_branch = f"prepare-microshift-bootc-shipment-{self.assembly}"
         target_branch = "main"
-        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
+        # Use existing timestamp if available (updating existing MR), otherwise create new one
+        timestamp = self.existing_shipment_timestamp or datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
 
         # Check if branch exists and switch to it, or create it
         branch_exists = await self.shipment_data_repo.does_branch_exist_on_remote(source_branch, remote="origin")
@@ -843,12 +888,12 @@ class BuildMicroShiftBootcPipeline:
         updated = await self._update_shipment_data(shipment_config, timestamp, commit_message, source_branch)
         if not updated:
             self._logger.info("No changes in shipment data. MR will not be created or updated.")
-            return "No changes to commit"
+            return None
 
         def _get_project(url):
             parsed_url = urlparse(url)
             project_path = parsed_url.path.strip('/').removesuffix('.git')
-            return self._get_gitlab().projects.get(project_path)
+            return self._gitlab.get_project(project_path)
 
         source_project = _get_project(self.shipment_data_repo_push_url)
         target_project = _get_project(self.shipment_data_repo_pull_url)
@@ -921,12 +966,12 @@ class BuildMicroShiftBootcPipeline:
 
         return await self.shipment_data_repo.commit_push(commit_message, safe=True)
 
-    def _get_gitlab(self):
-        """Get GitLab client instance"""
-        if not hasattr(self, '_gitlab_client'):
-            self._gitlab_client = gitlab.Gitlab(self.gitlab_url, private_token=self.gitlab_token)
-            self._gitlab_client.auth()
-        return self._gitlab_client
+    @cached_property
+    def _gitlab(self) -> GitLabClient:
+        """
+        Get GitLab client instance.
+        """
+        return GitLabClient(self.gitlab_url, self.gitlab_token, self.runtime.dry_run)
 
     @staticmethod
     def _basic_auth_url(url: str, token: str) -> str:

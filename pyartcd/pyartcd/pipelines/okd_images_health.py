@@ -1,6 +1,6 @@
 import asyncio
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import quote
 
@@ -62,6 +62,7 @@ class ImagesHealthPipeline:
             'doozer',
             f'--working-dir={doozer_working}',
             f'--data-path={self.data_path}',
+            '--load-okd-only',
             group_param,
         ]
 
@@ -241,7 +242,7 @@ class ImagesHealthPipeline:
         group = concern['group']
         # Transform openshift-X.Y to okd-X.Y for the OKD dashboard
         okd_group = group.replace('openshift-', 'okd-')
-        return f'{OKD_BUILD_HISTORY_URL}/?name={image_name}&group={okd_group}'
+        return f'{OKD_BUILD_HISTORY_URL}/?name=^{image_name}$&group={okd_group}'
 
     @staticmethod
     def get_logs_url(concern):

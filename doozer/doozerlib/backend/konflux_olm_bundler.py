@@ -12,9 +12,7 @@ from typing import Dict, Optional, Sequence, Tuple, cast
 import aiofiles
 import yaml
 from artcommonlib import exectools
-from artcommonlib import util as artlib_util
 from artcommonlib.constants import KONFLUX_ART_IMAGES_SHARE
-from artcommonlib.exectools import limit_concurrency
 from artcommonlib.konflux.konflux_build_record import KonfluxBuildOutcome, KonfluxBuildRecord, KonfluxBundleBuildRecord
 from artcommonlib.konflux.konflux_db import Engine, KonfluxDb
 from artcommonlib.model import Model
@@ -22,7 +20,7 @@ from artcommonlib.util import sync_to_quay
 from dockerfile_parse import DockerfileParser
 from doozerlib import constants, util
 from doozerlib.backend.build_repo import BuildRepo
-from doozerlib.backend.konflux_client import KonfluxClient, resource
+from doozerlib.backend.konflux_client import KonfluxClient
 from doozerlib.backend.pipelinerun_utils import PipelineRunInfo
 from doozerlib.image import ImageMetadata
 from doozerlib.record_logger import RecordLogger
@@ -251,13 +249,24 @@ class KonfluxOlmBundleRebaser:
         async with aiofiles.open(dest_annotations_path, 'w') as f:
             await f.write(yaml.safe_dump({'annotations': operator_framework_tags}))
 
-        # Copy bundle's dependencies.yaml
-        # Non-OCP products, such as MTC, may use dependencies.yaml
         if not metadata.runtime.group.startswith("openshift-"):
+            # Non-OCP products, such as MTC, may use dependencies.yaml
             dependencies_path = operator_manifests_dir / "metadata" / "dependencies.yaml"
             if dependencies_path.exists():
                 dest_dependencies_path = bundle_metadata_dir / "dependencies.yaml"
                 shutil.copy2(dependencies_path, dest_dependencies_path)
+
+            # Non-OCP products, such as Logging, may use properties.yaml
+            # Check for properties.yaml (in preferred location order)
+            candidate_paths = [
+                operator_manifests_dir / "openshift" / "metadata" / "properties.yaml",
+                operator_manifests_dir / "metadata" / "properties.yaml",
+            ]
+            for candidate in candidate_paths:
+                if candidate.exists():
+                    dest_properties_path = bundle_metadata_dir / "properties.yaml"
+                    shutil.copy2(candidate, dest_properties_path)
+                    break
 
         # Generate bundle's Dockerfile
         nvr = await asyncio.to_thread(
@@ -405,6 +414,7 @@ class KonfluxOlmBundleRebaser:
             'com.redhat.delivery.operator.bundle': 'true',
             'com.redhat.openshift.versions': versions.format(**self._group_config.vars),
         }
+        # TODO: deprecate pre-release mode support
         if mode == 'pre-release':
             labels['com.redhat.prerelease'] = 'true'
         return labels

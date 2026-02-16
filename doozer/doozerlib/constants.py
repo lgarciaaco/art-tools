@@ -40,14 +40,13 @@ KONFLUX_DEFAULT_IMAGE_REPO = (
     "quay.io/redhat-user-workloads/ocp-art-tenant/art-images"  # FIXME: If we change clusters this URL will change
 )
 KONFLUX_DEFAULT_FBC_REPO = "quay.io/redhat-user-workloads/ocp-art-tenant/art-fbc"
-ART_PROD_IMAGE_REPO = "quay.io/openshift-release-dev/ocp-v4.0-art-dev"
-ART_PROD_PRIV_IMAGE_REPO = "quay.io/openshift-release-dev/ocp-v4.0-art-dev-priv"
+# Legacy constants removed - use get_art_prod_image_repo_for_version() from artcommonlib.util instead
 DELIVERY_IMAGE_REGISTRY = "registry.redhat.io"
 KONFLUX_UI_HOST = "https://konflux-ui.apps.kflux-ocp-p01.7ayg.p1.openshiftapps.com"
 KONFLUX_UI_DEFAULT_WORKSPACE = "ocp-art"  # associated with ocp-art-tenant
-KONFLUX_DEFAULT_IMAGE_BUILD_PLR_TEMPLATE_URL = "https://api.github.com/repos/lgarciaaco/art-konflux-template/contents/.tekton/art-konflux-template-push.yaml?ref=ci/replace-clair-with-rox-scan"
-KONFLUX_DEFAULT_BUNDLE_BUILD_PLR_TEMPLATE_URL = "https://api.github.com/repos/lgarciaaco/art-konflux-template/contents/.tekton/art-bundle-konflux-template-push.yaml?ref=ci/replace-clair-with-rox-scan"
-KONFLUX_DEFAULT_FBC_BUILD_PLR_TEMPLATE_URL = "https://api.github.com/repos/lgarciaaco/art-konflux-template/contents/.tekton/art-fbc-konflux-template-push.yaml?ref=ci/replace-clair-with-rox-scan"
+KONFLUX_DEFAULT_IMAGE_BUILD_PLR_TEMPLATE_URL = "https://api.github.com/repos/openshift-priv/art-konflux-template/contents/.tekton/art-konflux-template-push.yaml?ref=ci/replace-clair-with-rox-scan"
+KONFLUX_DEFAULT_BUNDLE_BUILD_PLR_TEMPLATE_URL = "https://api.github.com/repos/openshift-priv/art-konflux-template/contents/.tekton/art-bundle-konflux-template-push.yaml?ref=ci/replace-clair-with-rox-scan"
+KONFLUX_DEFAULT_FBC_BUILD_PLR_TEMPLATE_URL = "https://api.github.com/repos/openshift-priv/art-konflux-template/contents/.tekton/art-fbc-konflux-template-push.yaml?ref=ci/replace-clair-with-rox-scan"
 ART_FBC_GIT_REPO = "git@github.com:openshift-priv/art-fbc.git"
 REGISTRY_PROXY_BASE_URL = "registry-proxy.engineering.redhat.com"
 BREW_REGISTRY_BASE_URL = "brew.registry.redhat.io"

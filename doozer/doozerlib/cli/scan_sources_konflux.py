@@ -7,7 +7,6 @@ import random
 import tempfile
 from datetime import datetime, timedelta, timezone
 from functools import wraps
-from json import JSONDecodeError
 from typing import Dict, List, Optional, cast
 
 import aiohttp
@@ -18,7 +17,6 @@ import pycares
 import yaml
 from artcommonlib import exectools
 from artcommonlib.arch_util import brew_arch_for_go_arch, go_arch_for_brew_arch
-from artcommonlib.constants import KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS
 from artcommonlib.exectools import cmd_gather_async
 from artcommonlib.konflux.konflux_build_record import Engine, KonfluxBuildOutcome, KonfluxBuildRecord
 from artcommonlib.konflux.package_rpm_finder import PackageRpmFinder
@@ -27,7 +25,7 @@ from artcommonlib.pushd import Dir
 from artcommonlib.release_util import isolate_timestamp_in_release
 from artcommonlib.rhcos import get_latest_layered_rhcos_build, get_primary_container_name
 from artcommonlib.rpm_utils import parse_nvr
-from artcommonlib.util import deep_merge, fetch_slsa_attestation
+from artcommonlib.util import deep_merge, fetch_slsa_attestation, uses_konflux_imagestream_override
 from async_lru import alru_cache
 from tenacity import retry, stop_after_attempt, wait_fixed
 
@@ -77,7 +75,7 @@ class ConfigScanSources:
         self.all_rpm_metas = set(runtime.rpm_metas())
         self.all_image_metas = set(
             filter(
-                lambda meta: meta.enabled or (meta.mode == 'disabled' and self.runtime.load_disabled),
+                lambda meta: self._is_image_enabled_for_scan(meta),
                 runtime.image_metas(),
             )
         )
@@ -97,12 +95,68 @@ class ConfigScanSources:
         self.registry_auth_file = os.getenv("KONFLUX_ART_IMAGES_AUTH_FILE")
         self.current_task_bundles: Dict[str, str] = {}
 
+    def _is_okd_enabled(self, image_meta: ImageMetadata) -> bool:
+        """
+        Check if an image has OKD mode enabled.
+
+        Arg(s):
+            image_meta (ImageMetadata): The image metadata.
+        Return Value(s):
+            bool: True if okd.mode is enabled, False otherwise.
+        """
+        return (
+            image_meta.config.okd is not Missing
+            and image_meta.config.okd.mode is not Missing
+            and image_meta.config.okd.mode == 'enabled'
+        )
+
+    def _is_image_enabled(self, image_meta: ImageMetadata) -> bool:
+        """
+        Check if an image should be processed (not disabled).
+
+        An image is considered enabled if:
+        - It's generally enabled (mode != 'disabled'), OR
+        - It has okd.mode: enabled (even if general mode: disabled)
+
+        Arg(s):
+            image_meta (ImageMetadata): The image metadata.
+        Return Value(s):
+            bool: True if image should be processed, False otherwise.
+        """
+        return image_meta.enabled or self._is_okd_enabled(image_meta)
+
+    def _is_image_enabled_for_scan(self, image_meta: ImageMetadata) -> bool:
+        """
+        Determine if an image should be included in scan-sources.
+
+        An image is included if:
+        - It's enabled (generally enabled OR okd.mode: enabled), OR
+        - load_disabled is set (includes all images even if disabled)
+
+        This ensures OKD-only images (mode: disabled, okd.mode: enabled) are scanned
+        so they can be built for OKD when they change.
+
+        Arg(s):
+            image_meta (ImageMetadata): The image metadata.
+        Return Value(s):
+            bool: True if image should be included, False otherwise.
+        """
+        # Include if enabled (handles both general and OKD-enabled cases)
+        if self._is_image_enabled(image_meta):
+            return True
+
+        # Include if disabled but load_disabled is set
+        if image_meta.mode == 'disabled' and self.runtime.load_disabled:
+            return True
+
+        return False
+
     async def run(self):
         # Try to rebase into openshift-priv to reduce upstream merge -> downstream build time
         if self.rebase_priv:
             major, minor = self.runtime.get_major_minor_fields()
             version = f'{major}.{minor}'
-            if version not in KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS:
+            if not uses_konflux_imagestream_override(version):
                 self.logger.warning(
                     'ocp4-scan for Konflux is not allowed to rebase into openshfit-priv version %s', version
                 )
@@ -265,8 +319,14 @@ class ConfigScanSources:
         ).get()
 
         for metadata, public_upstream in upstream_mappings:
-            # Skip rebase for disabled images
-            if not metadata.enabled:
+            # Skip rebase for disabled components
+            if metadata.meta_type == 'image':
+                # For images: use OKD-aware enabled check
+                if not self._is_image_enabled(metadata):
+                    self.logger.warning('%s is disabled: skipping rebase', metadata.name)
+                    continue
+            elif not metadata.enabled:
+                # For RPMs, use standard enabled check
                 self.logger.warning('%s is disabled: skipping rebase', metadata.name)
                 continue
 
@@ -388,8 +448,8 @@ class ConfigScanSources:
         self.latest_image_build_records_map.update((zip(image_names, latest_image_builds)))
 
     async def scan_images(self, image_names: List[str]):
-        # Do not scan images that have been disabled for Konflux operations
-        image_names = filter(lambda name: self.runtime.image_map[name].config.konflux.mode != 'disabled', image_names)
+        # Filter to only enabled images (generally enabled OR OKD-enabled)
+        image_names = filter(lambda name: self._is_image_enabled(self.runtime.image_map[name]), image_names)
 
         # Do not scan images that have already been requested for rebuild
         image_names = list(filter(lambda name: name not in self.changing_image_names, image_names))
@@ -1502,14 +1562,18 @@ class ConfigScanSources:
             if is_changing:
                 key = f'{image_meta.qualified_key}+{is_changing}'
                 code = self.assessment_code.get(key)
-                image_results.append(
-                    {
-                        'name': dgk,
-                        'changed': is_changing,
-                        'code': code.name if code else None,
-                        'reason': self.assessment_reason.get(key),
-                    }
-                )
+                # Check if this is an okd-only image (mode: disabled, okd.mode: enabled)
+                is_okd_only = not image_meta.enabled and self._is_okd_enabled(image_meta)
+                result = {
+                    'name': dgk,
+                    'changed': is_changing,
+                    'code': code.name if code else None,
+                    'reason': self.assessment_reason.get(key),
+                }
+                # Only add okd_only flag if True to avoid polluting the report
+                if is_okd_only:
+                    result['okd_only'] = True
+                image_results.append(result)
 
         rpm_results = []
         for rpm_meta in self.all_rpm_metas:
@@ -1594,6 +1658,7 @@ async def config_scan_source_changes_konflux(runtime: Runtime, ci_kubeconfig, as
 
     # Initialize group config: we need this to determine the canonical builders behavior
     runtime.initialize(config_only=True)
+    # Note: caller must use --load-okd-only flag to load OKD-only images for scanning
     runtime.initialize(mode='both', clone_distgits=False)
 
     async with aiohttp.ClientSession() as session:
