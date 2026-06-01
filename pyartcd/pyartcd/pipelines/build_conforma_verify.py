@@ -4,6 +4,7 @@ import os
 import re
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import List, Optional
 
 import click
@@ -27,6 +28,50 @@ from pyartcd.runtime import Runtime
 LOGGER = logutil.get_logger(__name__)
 
 BATCH_SIZE = 10
+
+
+@dataclass(frozen=True)
+class ComponentMeta:
+    nvr: str
+    konflux_name: str
+    metadata_name: str
+    snapshot_pullspec: str
+
+
+def _pullspec_lookup_keys(pullspec: str) -> list[str]:
+    """Return pullspec/digest keys used to match EC ImageRef lines to snapshot components."""
+    if not pullspec:
+        return []
+    keys = [pullspec]
+    if "@" not in pullspec:
+        return keys
+    digest = pullspec.split("@", 1)[1]
+    keys.append(digest)
+    if digest.startswith("sha256:"):
+        keys.append(digest.removeprefix("sha256:"))
+    return keys
+
+
+def _build_name_to_meta(records: list[KonfluxRecord]) -> dict[str, ComponentMeta]:
+    name_to_meta: dict[str, ComponentMeta] = {}
+    for record in records:
+        konflux_name = record.get_konflux_component_name()
+        name_to_meta[konflux_name] = ComponentMeta(
+            nvr=str(record.nvr),
+            konflux_name=konflux_name,
+            metadata_name=record.name,
+            snapshot_pullspec=record.image_pullspec,
+        )
+    return name_to_meta
+
+
+def _build_digest_to_name(batch: list[dict]) -> dict[str, str]:
+    digest_to_name: dict[str, str] = {}
+    for comp in batch:
+        konflux_name = comp["name"]
+        for key in _pullspec_lookup_keys(comp.get("containerImage", "")):
+            digest_to_name[key] = konflux_name
+    return digest_to_name
 
 
 class BuildConformaVerifyPipeline:
@@ -131,6 +176,7 @@ class BuildConformaVerifyPipeline:
         ec_policy = KONFLUX_DEFAULT_EC_POLICY_CONFIGURATION
         records = list(nvr_record_map.values())
         application_name = records[0].get_konflux_application_name()
+        name_to_meta = _build_name_to_meta(records)
 
         components = [
             {
@@ -237,10 +283,11 @@ class BuildConformaVerifyPipeline:
             condition = plr_info.find_condition("Succeeded")
             outcome = KonfluxBuildOutcome.extract_from_pipelinerun_succeeded_condition(condition)
             if outcome is not KonfluxBuildOutcome.SUCCESS:
-                self.logger.error("Batch %d FAILED. PLR: %s", batch_idx, plr_url)
-                violations = self._extract_violations_from_plr(plr_info, batch, konflux_client)
+                self.logger.error("Batch %d/%d FAILED. PLR: %s", batch_idx, total_batches, plr_url)
+                self._log_batch_roster(batch_idx, total_batches, batch, name_to_meta)
+                violations = self._extract_violations_from_plr(plr_info, batch, konflux_client, name_to_meta, batch_idx)
                 return {"batch": batch_idx, "plr_url": plr_url, "passed": False, "violations": violations}
-            self.logger.info("Batch %d PASSED. PLR: %s", batch_idx, plr_url)
+            self.logger.info("Batch %d/%d PASSED. PLR: %s", batch_idx, total_batches, plr_url)
             return {"batch": batch_idx, "plr_url": plr_url, "passed": True, "count": len(batch)}
 
         results = await asyncio.gather(*[_wait_for_batch(idx, batch, name) for idx, batch, name in batch_plrs])
@@ -263,25 +310,48 @@ class BuildConformaVerifyPipeline:
 
         self.logger.info("All %d components passed EC verification", len(components))
 
-    def _extract_violations_from_plr(
-        self, plr_info: PipelineRunInfo, batch: list[dict], konflux_client: KonfluxClient
-    ) -> list[dict]:
-        """Parse violation details from the verify pod logs of a failed PipelineRun.
-
-        Returns a list of dicts with keys: component_name, image_ref, rule, title, reason
-        """
-        digest_to_name = {}
+    def _log_batch_roster(
+        self,
+        batch_idx: int,
+        total_batches: int,
+        batch: list[dict],
+        name_to_meta: dict[str, ComponentMeta],
+    ) -> None:
+        self.logger.error("=== Batch %d/%d component roster ===", batch_idx, total_batches)
         for comp in batch:
-            image_ref = comp.get("containerImage", "")
-            digest = image_ref.split("@")[-1] if "@" in image_ref else image_ref
-            digest_to_name[digest] = comp["name"]
+            meta = name_to_meta.get(comp["name"])
+            if meta:
+                self.logger.error(
+                    "  NVR=%s | konflux=%s | metadata=%s | snapshot_pullspec=%s",
+                    meta.nvr,
+                    meta.konflux_name,
+                    meta.metadata_name,
+                    meta.snapshot_pullspec,
+                )
+            else:
+                self.logger.error(
+                    "  konflux=%s | snapshot_pullspec=%s (no Konflux DB metadata)",
+                    comp["name"],
+                    comp.get("containerImage", ""),
+                )
+
+    def _extract_violations_from_plr(
+        self,
+        plr_info: PipelineRunInfo,
+        batch: list[dict],
+        konflux_client: KonfluxClient,
+        name_to_meta: dict[str, ComponentMeta],
+        batch_idx: int,
+    ) -> list[dict]:
+        """Parse violation details from the verify pod logs of a failed PipelineRun."""
+        digest_to_name = _build_digest_to_name(batch)
 
         log_text = self._get_verify_pod_log(plr_info, konflux_client)
         if not log_text:
-            self.logger.warning("No verify pod log available for violation extraction")
+            self.logger.warning("No verify pod log available for violation extraction (batch %d)", batch_idx)
             return []
 
-        return self._parse_violations_from_log(log_text, digest_to_name)
+        return self._parse_violations_from_log(log_text, digest_to_name, name_to_meta, batch_idx)
 
     def _get_verify_pod_log(self, plr_info: PipelineRunInfo, konflux_client: KonfluxClient) -> Optional[str]:
         """Fetch the report log from the verify pod of a failed PipelineRun.
@@ -318,18 +388,57 @@ class BuildConformaVerifyPipeline:
         return None
 
     @staticmethod
-    def _parse_violations_from_log(log_text: str, digest_to_name: dict[str, str]) -> list[dict]:
-        """Parse the EC detailed-report log and extract violation entries.
+    def _resolve_konflux_name(image_ref: str, digest_to_name: dict[str, str]) -> str:
+        if image_ref in digest_to_name:
+            return digest_to_name[image_ref]
+        if "@" in image_ref:
+            digest = image_ref.split("@", 1)[1]
+            if digest in digest_to_name:
+                return digest_to_name[digest]
+            if digest.startswith("sha256:"):
+                bare = digest.removeprefix("sha256:")
+                if bare in digest_to_name:
+                    return digest_to_name[bare]
+        return image_ref
 
-        Each violation block in the log looks like:
-            ✕ [Violation] rule.name
-              ImageRef: quay.io/...@sha256:abc123
-              Reason: <multiline reason text>
-              Term: ...
-              Title: Human readable title
-              Description: ...
-              Solution: ...
-        """
+    @staticmethod
+    def _enrich_violation(
+        *,
+        konflux_name: str,
+        image_ref: str,
+        rule: str,
+        title: str,
+        reason: str,
+        name_to_meta: dict[str, ComponentMeta],
+        batch_idx: int,
+    ) -> dict:
+        meta = name_to_meta.get(konflux_name)
+        unresolved = meta is None
+        pullspec_mismatch = bool(meta and image_ref and meta.snapshot_pullspec and meta.snapshot_pullspec != image_ref)
+        return {
+            "component_name": konflux_name,
+            "image_ref": image_ref,
+            "rule": rule,
+            "title": title,
+            "reason": reason,
+            "batch": batch_idx,
+            "nvr": meta.nvr if meta else None,
+            "konflux_name": meta.konflux_name if meta else konflux_name,
+            "metadata_name": meta.metadata_name if meta else None,
+            "snapshot_pullspec": meta.snapshot_pullspec if meta else None,
+            "unresolved": unresolved,
+            "pullspec_mismatch": pullspec_mismatch,
+        }
+
+    @classmethod
+    def _parse_violations_from_log(
+        cls,
+        log_text: str,
+        digest_to_name: dict[str, str],
+        name_to_meta: dict[str, ComponentMeta],
+        batch_idx: int,
+    ) -> list[dict]:
+        """Parse the EC detailed-report log and extract violation entries."""
         violations: list[dict] = []
 
         block_pattern = re.compile(r'✕ \[Violation\] (\S+)(.*?)(?=✕ \[Violation\]|\Z)', re.DOTALL)
@@ -354,57 +463,102 @@ class BuildConformaVerifyPipeline:
             if title_match:
                 title = title_match.group(1).strip()
 
-            digest = image_ref.split("@")[-1] if "@" in image_ref else image_ref
-            component_name = digest_to_name.get(digest, image_ref)
-
+            konflux_name = cls._resolve_konflux_name(image_ref, digest_to_name)
             violations.append(
-                {
-                    "component_name": component_name,
-                    "image_ref": image_ref,
-                    "rule": rule,
-                    "title": title,
-                    "reason": reason,
-                }
+                cls._enrich_violation(
+                    konflux_name=konflux_name,
+                    image_ref=image_ref,
+                    rule=rule,
+                    title=title,
+                    reason=reason,
+                    name_to_meta=name_to_meta,
+                    batch_idx=batch_idx,
+                )
             )
 
         return violations
 
     def _aggregate_violations(self, failed_batches: list[dict]) -> dict[str, list[dict]]:
-        """Aggregate violations across all failed batches, keyed by component name."""
-        by_component: dict[str, list[dict]] = defaultdict(list)
+        """Aggregate violations across failed batches, keyed by NVR or component identity."""
+        by_key: dict[str, list[dict]] = defaultdict(list)
         for fb in failed_batches:
             for v in fb.get("violations", []):
-                by_component[v["component_name"]].append(v)
-        return dict(by_component)
+                key = v.get("nvr") or v["component_name"]
+                by_key[key].append(v)
+        return dict(by_key)
 
-    def _log_violation_summary(self, all_violations: dict[str, list[dict]], failed_batches: list[dict]):
+    def _log_violation_summary(
+        self,
+        all_violations: dict[str, list[dict]],
+        failed_batches: list[dict],
+    ) -> None:
         """Log a human-readable summary of all EC violations."""
         self.logger.error("=== EC Violation Details ===")
         if not all_violations:
-            self.logger.error("Failed batches:")
+            self.logger.error("Failed batches (no parsed violation details):")
             for fb in failed_batches:
-                self.logger.error("  Batch %d: %s (no violation details available)", fb["batch"], fb["plr_url"])
+                self.logger.error("  Batch %d: %s", fb["batch"], fb["plr_url"])
             return
 
         unique_rules: set[str] = set()
-        for component_name, violations in sorted(all_violations.items()):
-            self.logger.error("  Component: %s", component_name)
-            self.logger.error("    ImageRef: %s", violations[0]["image_ref"])
+        rule_counts: dict[str, int] = defaultdict(int)
+        mismatch_count = 0
+        unresolved_count = 0
+
+        for _key, violations in sorted(all_violations.items()):
+            v0 = violations[0]
+            if v0.get("unresolved"):
+                unresolved_count += 1
+            if v0.get("pullspec_mismatch"):
+                mismatch_count += 1
+
+            label = v0.get("konflux_name") or v0["component_name"]
+            if v0.get("unresolved"):
+                self.logger.error("  Component: UNRESOLVED (EC ImageRef: %s)", v0["image_ref"])
+            else:
+                self.logger.error("  Component: %s", label)
+
+            if v0.get("nvr"):
+                self.logger.error("    NVR: %s", v0["nvr"])
+            if v0.get("metadata_name"):
+                self.logger.error("    Metadata name: %s", v0["metadata_name"])
+            if v0.get("snapshot_pullspec"):
+                self.logger.error("    Snapshot pullspec: %s", v0["snapshot_pullspec"])
+            self.logger.error("    Violation ImageRef: %s", v0["image_ref"])
+            if v0.get("pullspec_mismatch"):
+                self.logger.error(
+                    "    [MISMATCH] EC ImageRef digest differs from snapshot pullspec (see batch %d roster above)",
+                    v0.get("batch"),
+                )
+            if v0.get("unresolved") and v0.get("batch") is not None:
+                self.logger.error(
+                    "    [UNRESOLVED] Could not map ImageRef to a snapshot component; see batch %d roster in log above",
+                    v0["batch"],
+                )
+
             seen_rules: set[str] = set()
             for v in violations:
                 if v["rule"] not in seen_rules:
                     seen_rules.add(v["rule"])
                     unique_rules.add(v["rule"])
+                    rule_counts[v["rule"]] += 1
                     self.logger.error("    - [%s] %s", v["rule"], v["title"])
                     if v["reason"]:
                         self.logger.error("      Reason: %s", v["reason"])
 
         self.logger.error("---")
         self.logger.error(
-            "Total: %d unique component(s) with violations, %d unique rule(s) violated",
+            "Total: %d component(s) with violations, %d unique rule(s), "
+            "%d unresolved ImageRef(s), %d pullspec mismatch(es)",
             len(all_violations),
             len(unique_rules),
+            unresolved_count,
+            mismatch_count,
         )
+        if rule_counts:
+            self.logger.error("Violations by rule:")
+            for rule, count in sorted(rule_counts.items()):
+                self.logger.error("  %s: %d", rule, count)
         self.logger.error("Failed batches:")
         for fb in failed_batches:
             self.logger.error("  Batch %d: %s", fb["batch"], fb["plr_url"])
