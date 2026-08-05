@@ -73,6 +73,7 @@ from doozerlib.cli.scan_fips import scan_fips
 from doozerlib.cli.scan_osh import scan_osh
 from doozerlib.cli.scan_sources import config_scan_source_changes
 from doozerlib.cli.scan_sources_konflux import config_scan_source_changes_konflux
+from doozerlib.cli.golang_builder_shipment import golang_builder_shipment
 from doozerlib.exceptions import DoozerFatalError
 from doozerlib.util import analyze_debug_timing
 

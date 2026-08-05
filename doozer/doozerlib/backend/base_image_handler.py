@@ -241,7 +241,9 @@ class BaseImageHandler:
                 raise ValueError(f"Group name '{self.runtime.group}' produces invalid normalized name for Kubernetes")
 
             timestamp = get_utc_now_formatted_str()
-            comp_name = _truncate_for_k8s_name(component["name"], 63 - len(group_safe) - len(timestamp) - 2)
+            comp_name = _truncate_for_k8s_name(
+                component["name"].replace(".", "-"), 63 - len(group_safe) - len(timestamp) - 2
+            )
             snapshot_name = f"{group_safe}-{comp_name}-{timestamp}"
 
             if self.dry_run:
