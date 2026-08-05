@@ -383,7 +383,7 @@ class GolangBuilderShipmentHandler:
         if not pushed:
             raise RuntimeError("Failed to push shipment data to remote")
 
-        mr_title = f"Draft: Golang builder shipment for {golang_group}"
+        mr_title = f"Golang builder shipment for {golang_group}"
         mr_description = f"Golang builder shipment for OCP {ocp_version}\n\n"
         mr_description += f"Group: {golang_group}\n"
         mr_description += f"Environment: {env}\n"
