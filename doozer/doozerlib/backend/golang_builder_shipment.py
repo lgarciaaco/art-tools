@@ -258,10 +258,14 @@ class GolangBuilderShipmentHandler:
         release_plan: str,
         ocp_version: str,
     ) -> ShipmentConfig:
+        # group must match the ocp-build-data branch name that elliott resolves.
+        # For golang builders this is "golang", not the version-specific group
+        # (e.g. "rhel-9-golang-1.25"). Version specificity lives in the snapshot
+        # component names (e.g. "rhel-9-golang-1-25-openshift-golang-builder").
         metadata = Metadata(
             product=_PRODUCT,
             application=snapshot.spec.application,
-            group=golang_group,
+            group="golang",
             assembly="stream",
         )
 
@@ -359,7 +363,7 @@ class GolangBuilderShipmentHandler:
         await self.shipment_data_repo.create_branch(source_branch)
 
         application = shipment_config.shipment.metadata.application
-        relative_target_dir = Path("shipment") / _PRODUCT / golang_group / application / env
+        relative_target_dir = Path("shipment") / _PRODUCT / "golang" / application / env
         target_dir = self.shipment_data_repo._directory / relative_target_dir
         target_dir.mkdir(parents=True, exist_ok=True)
 
