@@ -38,6 +38,7 @@ from elliottlib.shipment_model import (
     Snapshot,
     SnapshotComponent,
     SnapshotSpec,
+    Tools,
 )
 from pyartcd.git import GitRepository
 
@@ -296,6 +297,9 @@ class GolangBuilderShipmentHandler:
             environments=environments,
             snapshot=snapshot,
             data=Data(releaseNotes=release_notes),
+            # Temporary: until openshift-eng/ocp-build-data#12139 merges, point
+            # stage at the fork that has assemblies.enabled for the golang group.
+            tools=Tools(build_data="lgarciaaco@art-20930/golang-assemblies-enabled"),
         )
 
         config = ShipmentConfig(shipment=shipment)
