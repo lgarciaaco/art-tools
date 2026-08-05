@@ -415,4 +415,17 @@ class GolangBuilderShipmentHandler:
             }
         )
         self.logger.info("Created Draft MR: %s", mr.web_url)
+
+        # The project has default approval rules (ART + ERT + Docs).
+        # Golang builder shipments only require ART sign-off — strip the rest.
+        try:
+            mr_iid = int(mr.web_url.split("/merge_requests/")[1])
+            target_mr = target_project.mergerequests.get(mr_iid)
+            for rule in target_mr.approval_rules.list():
+                if rule.name != "ART":
+                    self.logger.info("Removing approval rule '%s' (not needed for golang builder shipment)", rule.name)
+                    rule.delete()
+        except Exception as e:
+            self.logger.warning("Could not clean up approval rules: %s", e)
+
         return mr.web_url
