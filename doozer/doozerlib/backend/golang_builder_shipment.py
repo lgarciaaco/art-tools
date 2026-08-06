@@ -22,7 +22,6 @@ from artcommonlib.constants import REDHAT_GITLAB_URL, SHIPMENT_DATA_URL_TEMPLATE
 from artcommonlib.release_util import isolate_el_version_in_release
 from artcommonlib.rpm_utils import parse_nvr
 from artcommonlib.util import new_roundtrip_yaml_handler
-from doozerlib.backend.base_image_handler import _software_lifecycle_phase
 from doozerlib.constants import ART_IMAGES_BASE_APPLICATION
 from doozerlib.util import konflux_golang_builder_component_name
 from elliottlib.shipment_model import (
@@ -52,8 +51,8 @@ def format_shipment_mr_title(golang_group: str) -> str:
 
 
 GOLANG_BUILDER_SHIPMENT_RELEASE_PLAN_MAP = {
+    "stage": "ocp-art-golang-builder-ec-rhel9",
     "prod": "ocp-art-golang-builder-prod-rhel9",
-    "ec": "ocp-art-golang-builder-ec-rhel9",
 }
 
 
@@ -81,10 +80,7 @@ def basic_auth_url(url: str, token: str) -> str:
 
 
 def resolve_env_from_runtime(runtime) -> str:
-    """Map doozer runtime lifecycle phase to shipment env (prod or ec)."""
-    phase = _software_lifecycle_phase(runtime)
-    if phase == "pre-release":
-        return "ec"
+    """Return the shipment target env for MR placement (always prod)."""
     return "prod"
 
 
@@ -115,13 +111,17 @@ class GolangBuilderShipmentHandler:
 
     @staticmethod
     def resolve_release_plan(env: str) -> str:
-        """Map lifecycle env to the correct ReleasePlan name."""
+        """Map shipment env to the correct ReleasePlan name."""
         plan = GOLANG_BUILDER_SHIPMENT_RELEASE_PLAN_MAP.get(env)
         if not plan:
             raise ValueError(
                 f"Unknown env '{env}'. Must be one of: {list(GOLANG_BUILDER_SHIPMENT_RELEASE_PLAN_MAP.keys())}"
             )
         return plan
+
+    def _map_env_to_release_plan(self, env: str) -> str:
+        """Map shipment env key to ReleasePlan name."""
+        return self.resolve_release_plan(env)
 
     async def create_shipment(
         self,
@@ -158,8 +158,6 @@ class GolangBuilderShipmentHandler:
                 snapshot=snapshot,
                 nvrs=[nvr],
                 golang_group=golang_group,
-                env=env,
-                release_plan=release_plan,
                 ocp_version=ocp_version,
             )
             mr_url = await self._create_shipment_mr(
@@ -204,8 +202,6 @@ class GolangBuilderShipmentHandler:
             snapshot=snapshot,
             nvrs=nvrs,
             golang_group=golang_group,
-            env=env,
-            release_plan=release_plan,
             ocp_version=ocp_version,
         )
         mr_url = await self._create_shipment_mr(
@@ -276,8 +272,6 @@ class GolangBuilderShipmentHandler:
         snapshot: Snapshot,
         nvrs: List[str],
         golang_group: str,
-        env: str,
-        release_plan: str,
         ocp_version: str,
     ) -> ShipmentConfig:
         # group must match the ocp-build-data branch name that elliott resolves.
@@ -292,8 +286,8 @@ class GolangBuilderShipmentHandler:
         )
 
         environments = Environments(
-            stage=ShipmentEnv(releasePlan=release_plan),
-            prod=ShipmentEnv(releasePlan=release_plan),
+            stage=ShipmentEnv(releasePlan=self._map_env_to_release_plan("stage")),
+            prod=ShipmentEnv(releasePlan=self._map_env_to_release_plan("prod")),
         )
 
         release_notes = ReleaseNotes(
