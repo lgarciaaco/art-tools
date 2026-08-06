@@ -32,24 +32,28 @@ class TestResolveReleasePlan(unittest.TestCase):
         plan = GolangBuilderShipmentHandler.resolve_release_plan("prod")
         self.assertEqual(plan, "ocp-art-golang-builder-prod-rhel9")
 
-    def test_ec_returns_ec_plan(self):
-        plan = GolangBuilderShipmentHandler.resolve_release_plan("ec")
+    def test_stage_returns_ec_plan(self):
+        plan = GolangBuilderShipmentHandler.resolve_release_plan("stage")
         self.assertEqual(plan, "ocp-art-golang-builder-ec-rhel9")
 
     def test_unknown_env_raises(self):
         with self.assertRaises(ValueError):
             GolangBuilderShipmentHandler.resolve_release_plan("staging")
 
+    def test_removed_ec_key_raises(self):
+        with self.assertRaises(ValueError):
+            GolangBuilderShipmentHandler.resolve_release_plan("ec")
+
     def test_map_keys_are_complete(self):
+        self.assertIn("stage", GOLANG_BUILDER_SHIPMENT_RELEASE_PLAN_MAP)
         self.assertIn("prod", GOLANG_BUILDER_SHIPMENT_RELEASE_PLAN_MAP)
-        self.assertIn("ec", GOLANG_BUILDER_SHIPMENT_RELEASE_PLAN_MAP)
 
 
 class TestResolveEnvFromRuntime(unittest.TestCase):
-    def test_pre_release_returns_ec(self):
+    def test_pre_release_returns_prod(self):
         runtime = Mock()
         runtime.group_config = Model({"software_lifecycle": {"phase": "pre-release"}})
-        self.assertEqual(resolve_env_from_runtime(runtime), "ec")
+        self.assertEqual(resolve_env_from_runtime(runtime), "prod")
 
     def test_release_returns_prod(self):
         runtime = Mock()
@@ -116,14 +120,16 @@ spec:
             snapshot=snapshot,
             nvrs=nvrs,
             golang_group="rhel-9-golang-1.25",
-            env="prod",
-            release_plan="ocp-art-golang-builder-prod-rhel9",
             ocp_version="4.22",
         )
 
         self.assertEqual(config.shipment.metadata.product, "ocp")
         self.assertEqual(config.shipment.metadata.application, ART_IMAGES_BASE_APPLICATION)
         self.assertEqual(config.shipment.metadata.group, "golang")
+        self.assertEqual(
+            config.shipment.environments.stage.releasePlan,
+            "ocp-art-golang-builder-ec-rhel9",
+        )
         self.assertEqual(
             config.shipment.environments.prod.releasePlan,
             "ocp-art-golang-builder-prod-rhel9",
@@ -136,7 +142,7 @@ spec:
     @patch("doozerlib.backend.golang_builder_shipment.exectools.cmd_gather_async")
     @patch("doozerlib.backend.golang_builder_shipment.os.unlink")
     @patch.dict("os.environ", {}, clear=False)
-    def test_build_shipment_config_ec(self, mock_unlink, mock_cmd):
+    def test_build_shipment_config_uses_split_release_plans(self, mock_unlink, mock_cmd):
         mock_cmd.return_value = (
             0,
             """
@@ -166,14 +172,16 @@ spec:
             snapshot=snapshot,
             nvrs=nvrs,
             golang_group="rhel-9-golang-1.26",
-            env="ec",
-            release_plan="ocp-art-golang-builder-ec-rhel9",
             ocp_version="4.22",
         )
 
         self.assertEqual(
-            config.shipment.environments.prod.releasePlan,
+            config.shipment.environments.stage.releasePlan,
             "ocp-art-golang-builder-ec-rhel9",
+        )
+        self.assertEqual(
+            config.shipment.environments.prod.releasePlan,
+            "ocp-art-golang-builder-prod-rhel9",
         )
 
 
