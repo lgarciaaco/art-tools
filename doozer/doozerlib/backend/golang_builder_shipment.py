@@ -283,6 +283,7 @@ class GolangBuilderShipmentHandler:
             application=snapshot.spec.application,
             group="golang",
             assembly="stream",
+            advisory_required=False,
         )
 
         environments = Environments(

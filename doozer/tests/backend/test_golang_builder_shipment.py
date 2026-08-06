@@ -126,6 +126,7 @@ spec:
         self.assertEqual(config.shipment.metadata.product, "ocp")
         self.assertEqual(config.shipment.metadata.application, ART_IMAGES_BASE_APPLICATION)
         self.assertEqual(config.shipment.metadata.group, "golang")
+        self.assertFalse(config.shipment.metadata.advisory_required)
         self.assertEqual(
             config.shipment.environments.stage.releasePlan,
             "ocp-art-golang-builder-ec-rhel9",
