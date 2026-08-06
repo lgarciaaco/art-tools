@@ -10,8 +10,21 @@ from doozerlib.backend.golang_builder_shipment import (
     GolangBuilderShipmentHandler,
     basic_auth_url,
     derive_golang_group,
+    format_shipment_mr_title,
     resolve_env_from_runtime,
 )
+
+SAMPLE_GOLANG_NVR = (
+    "openshift-golang-builder-container-v1.25.8-202604081607.p0.g2aa6a05.el9"
+)
+
+
+class TestFormatShipmentMrTitle(unittest.TestCase):
+    def test_title_matches_shipment_convention(self):
+        self.assertEqual(
+            format_shipment_mr_title("rhel-9-golang-1.25"),
+            "Shipment for rhel-9-golang-1.25",
+        )
 
 
 class TestResolveReleasePlan(unittest.TestCase):
@@ -110,7 +123,7 @@ spec:
 
         self.assertEqual(config.shipment.metadata.product, "ocp")
         self.assertEqual(config.shipment.metadata.application, ART_IMAGES_BASE_APPLICATION)
-        self.assertEqual(config.shipment.metadata.group, "rhel-9-golang-1.25")
+        self.assertEqual(config.shipment.metadata.group, "golang")
         self.assertEqual(
             config.shipment.environments.prod.releasePlan,
             "ocp-art-golang-builder-prod-rhel9",
@@ -209,7 +222,7 @@ class TestCreateShipmentMR(IsolatedAsyncioTestCase):
 
         self.assertEqual(result, mock_mr.web_url)
         create_args = mock_project.mergerequests.create.call_args[0][0]
-        self.assertIn("Golang builder shipment", create_args["title"])
+        self.assertEqual(create_args["title"], "Shipment for rhel-9-golang-1.25")
         self.assertEqual(create_args["target_branch"], "main")
 
 
@@ -248,7 +261,7 @@ spec:
         runtime.logger = Mock()
         runtime.group_config = Model({})
         handler = GolangBuilderShipmentHandler(runtime=runtime)
-        await handler._create_snapshot_via_elliott(["some-nvr"], "rhel-9-golang-1.25")
+        await handler._create_snapshot_via_elliott([SAMPLE_GOLANG_NVR], "rhel-9-golang-1.25")
         cmd_args = mock_cmd.call_args[0][0]
         self.assertTrue(any("--pull-secret=" in str(a) for a in cmd_args))
 
@@ -277,9 +290,11 @@ spec:
         runtime.logger = Mock()
         runtime.group_config = Model({})
         handler = GolangBuilderShipmentHandler(runtime=runtime, art_jira="ART-20930", ocp_version="4.22")
-        snapshot = await handler._create_snapshot_via_elliott(["some-nvr"], "rhel-9-golang-1.25")
+        nvr = "openshift-golang-builder-container-v1.25.8-202604081607.p0.g2aa6a05.el9"
+        snapshot = await handler._create_snapshot_via_elliott([nvr], "rhel-9-golang-1.25")
 
         self.assertEqual(snapshot.spec.application, ART_IMAGES_BASE_APPLICATION)
+        self.assertEqual(snapshot.spec.components[0].name, "golang-builder-v1.25-rhel9")
 
 
 class TestCreateSnapshotErrors(IsolatedAsyncioTestCase):
@@ -296,7 +311,7 @@ class TestCreateSnapshotErrors(IsolatedAsyncioTestCase):
         mock_cmd.return_value = (1, "", "elliott error: NVR not found")
         handler = self._make_handler()
         with self.assertRaises(RuntimeError) as ctx:
-            await handler._create_snapshot_via_elliott(["some-nvr"], "rhel-9-golang-1.25")
+            await handler._create_snapshot_via_elliott([SAMPLE_GOLANG_NVR], "rhel-9-golang-1.25")
         self.assertIn("elliott snapshot new failed", str(ctx.exception))
 
     @patch("doozerlib.backend.golang_builder_shipment.exectools.cmd_gather_async")
@@ -306,7 +321,7 @@ class TestCreateSnapshotErrors(IsolatedAsyncioTestCase):
         mock_cmd.return_value = (0, "", "")
         handler = self._make_handler()
         with self.assertRaises(ValueError) as ctx:
-            await handler._create_snapshot_via_elliott(["some-nvr"], "rhel-9-golang-1.25")
+            await handler._create_snapshot_via_elliott([SAMPLE_GOLANG_NVR], "rhel-9-golang-1.25")
         self.assertIn("invalid output", str(ctx.exception))
 
     @patch("doozerlib.backend.golang_builder_shipment.exectools.cmd_gather_async")
@@ -316,7 +331,7 @@ class TestCreateSnapshotErrors(IsolatedAsyncioTestCase):
         mock_cmd.return_value = (0, "apiVersion: v1\nkind: Snapshot\n", "")
         handler = self._make_handler()
         with self.assertRaises(ValueError) as ctx:
-            await handler._create_snapshot_via_elliott(["some-nvr"], "rhel-9-golang-1.25")
+            await handler._create_snapshot_via_elliott([SAMPLE_GOLANG_NVR], "rhel-9-golang-1.25")
         self.assertIn("missing 'spec'", str(ctx.exception))
 
 
@@ -409,7 +424,34 @@ class TestBuildInlineSnapshot(unittest.TestCase):
         self.assertEqual(snapshot.spec.application, ART_IMAGES_BASE_APPLICATION)
         self.assertEqual(snapshot.nvrs, [nvr])
         self.assertEqual(snapshot.spec.components[0].containerImage, "quay.io/test@sha256:abc")
-        self.assertEqual(snapshot.spec.components[0].name, "rhel-9-golang-1-25-openshift-golang-builder")
+        self.assertEqual(snapshot.spec.components[0].name, "golang-builder-v1.25-rhel9")
+
+
+class TestApplyRpaComponentNames(unittest.TestCase):
+    def test_renames_konflux_cr_name_from_elliott(self):
+        from elliottlib.shipment_model import ComponentSource, GitSource, Snapshot, SnapshotComponent, SnapshotSpec
+
+        nvr = "openshift-golang-builder-container-v1.25.11-202607210212.p2.g6245b3b.el9"
+        snapshot = Snapshot(
+            spec=SnapshotSpec(
+                application=ART_IMAGES_BASE_APPLICATION,
+                components=[
+                    SnapshotComponent(
+                        name="rhel-9-golang-1-25-openshift-golang-builder",
+                        containerImage="quay.io/test@sha256:abc",
+                        source=ComponentSource(
+                            git=GitSource(
+                                url="https://github.com/openshift-eng/ocp-build-data",
+                                revision="abc123",
+                            ),
+                        ),
+                    )
+                ],
+            ),
+            nvrs=[nvr],
+        )
+        GolangBuilderShipmentHandler._apply_rpa_component_names(snapshot, [nvr])
+        self.assertEqual(snapshot.spec.components[0].name, "golang-builder-v1.25-rhel9")
 
 
 class TestDeriveGolangGroup(unittest.TestCase):

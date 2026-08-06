@@ -24,7 +24,7 @@ from artcommonlib.rpm_utils import parse_nvr
 from artcommonlib.util import new_roundtrip_yaml_handler
 from doozerlib.backend.base_image_handler import _software_lifecycle_phase
 from doozerlib.constants import ART_IMAGES_BASE_APPLICATION
-from doozerlib.util import konflux_image_component_name
+from doozerlib.util import konflux_golang_builder_component_name
 from elliottlib.shipment_model import (
     ComponentSource,
     Data,
@@ -45,6 +45,11 @@ from pyartcd.git import GitRepository
 yaml = new_roundtrip_yaml_handler()
 
 _PRODUCT = "ocp"
+
+def format_shipment_mr_title(golang_group: str) -> str:
+    """Match ocp-shipment-data convention: ``Shipment for 4.21.28 (ship date: …)``."""
+    return f"Shipment for {golang_group}"
+
 
 GOLANG_BUILDER_SHIPMENT_RELEASE_PLAN_MAP = {
     "prod": "ocp-art-golang-builder-prod-rhel9",
@@ -231,6 +236,22 @@ class GolangBuilderShipmentHandler:
         await self.shipment_data_repo.fetch_switch_branch("main")
 
     @staticmethod
+    def _apply_rpa_component_names(snapshot: Snapshot, nvrs: List[str]) -> None:
+        """Rewrite snapshot component names to RPA mapping names (same as BaseImageHandler)."""
+        components = snapshot.spec.components
+        if len(components) != len(nvrs):
+            raise ValueError(
+                f"Cannot map {len(nvrs)} NVR(s) to {len(components)} snapshot component(s)"
+            )
+        if len(nvrs) == 1:
+            components[0].name = konflux_golang_builder_component_name(nvrs[0])
+            return
+        sorted_nvrs = sorted(nvrs, key=konflux_golang_builder_component_name)
+        sorted_components = sorted(components, key=lambda c: c.name)
+        for component, nvr in zip(sorted_components, sorted_nvrs):
+            component.name = konflux_golang_builder_component_name(nvr)
+
+    @staticmethod
     def _build_inline_snapshot(
         nvr: str,
         golang_group: str,
@@ -239,7 +260,7 @@ class GolangBuilderShipmentHandler:
         rebase_commitish: str,
     ) -> Snapshot:
         component = SnapshotComponent(
-            name=konflux_image_component_name(golang_group, "openshift-golang-builder"),
+            name=konflux_golang_builder_component_name(nvr),
             containerImage=container_image,
             source=ComponentSource(
                 git=GitSource(url=rebase_repo_url, revision=rebase_commitish),
@@ -262,7 +283,7 @@ class GolangBuilderShipmentHandler:
         # group must match the ocp-build-data branch name that elliott resolves.
         # For golang builders this is "golang", not the version-specific group
         # (e.g. "rhel-9-golang-1.25"). Version specificity lives in the snapshot
-        # component names (e.g. "rhel-9-golang-1-25-openshift-golang-builder").
+        # component names (e.g. "golang-builder-v1.25-rhel9") must match RPA mapping.
         metadata = Metadata(
             product=_PRODUCT,
             application=snapshot.spec.application,
@@ -349,6 +370,7 @@ class GolangBuilderShipmentHandler:
             nvrs=nvrs,
         )
         snapshot.spec.application = ART_IMAGES_BASE_APPLICATION
+        self._apply_rpa_component_names(snapshot, nvrs)
         return snapshot
 
     async def _create_shipment_mr(
@@ -391,7 +413,7 @@ class GolangBuilderShipmentHandler:
         if not pushed:
             raise RuntimeError("Failed to push shipment data to remote")
 
-        mr_title = f"Golang builder shipment for {golang_group}"
+        mr_title = format_shipment_mr_title(golang_group)
         mr_description = f"Golang builder shipment for OCP {ocp_version}\n\n"
         mr_description += f"Group: {golang_group}\n"
         mr_description += f"Environment: {env}\n"
